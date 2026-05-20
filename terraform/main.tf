@@ -344,3 +344,63 @@ resource "aws_cloudwatch_log_group" "step_functions" {
     Usage = "Step Functions execution logs"
   }
 }
+
+
+# ── DATA UPLOAD ──────────────────────────────────────────────────────────────
+# Uploads local CSV files into the raw bucket. etag triggers re-upload only
+# when the file content changes.
+
+resource "aws_s3_object" "songs_data" {
+  bucket = aws_s3_bucket.raw.id
+  key    = "songs/songs.csv"
+  source = "${path.module}/../data/songs/songs.csv"
+  etag   = filemd5("${path.module}/../data/songs/songs.csv")
+
+  tags = {
+    Layer = "bronze"
+  }
+}
+
+resource "aws_s3_object" "streams1_data" {
+  bucket = aws_s3_bucket.raw.id
+  key    = "streams/streams1.csv"
+  source = "${path.module}/../data/streams/streams1.csv"
+  etag   = filemd5("${path.module}/../data/streams/streams1.csv")
+
+  tags = {
+    Layer = "bronze"
+  }
+}
+
+resource "aws_s3_object" "streams2_data" {
+  bucket = aws_s3_bucket.raw.id
+  key    = "streams/streams2.csv"
+  source = "${path.module}/../data/streams/streams2.csv"
+  etag   = filemd5("${path.module}/../data/streams/streams2.csv")
+
+  tags = {
+    Layer = "bronze"
+  }
+}
+
+resource "aws_s3_object" "streams3_data" {
+  bucket = aws_s3_bucket.raw.id
+  key    = "streams/streams3.csv"
+  source = "${path.module}/../data/streams/streams3.csv"
+  etag   = filemd5("${path.module}/../data/streams/streams3.csv")
+
+  tags = {
+    Layer = "bronze"
+  }
+}
+
+resource "aws_s3_object" "users_data" {
+  bucket = aws_s3_bucket.raw.id
+  key    = "users/users.csv"
+  source = "${path.module}/../data/users/users.csv"
+  etag   = filemd5("${path.module}/../data/users/users.csv")
+
+  tags = {
+    Layer = "bronze"
+  }
+}
