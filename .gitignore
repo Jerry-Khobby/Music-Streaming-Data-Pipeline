@@ -10,3 +10,6 @@ data
 terraform/.terraform
 terraform/.terraform.lock.hcl 
 
+
+data/**
+data 
