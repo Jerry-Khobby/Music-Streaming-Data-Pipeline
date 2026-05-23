@@ -80,3 +80,35 @@ output "step_functions_log_group" {
   description = "CloudWatch log group for Step Functions executions"
   value       = aws_cloudwatch_log_group.step_functions.name
 }
+
+# ── GLUE JOBS ─────────────────────────────────────────────────
+
+output "glue_job_validation" {
+  description = "Glue job name — step 1: validates raw catalog tables"
+  value       = aws_glue_job.validation.name
+}
+
+output "glue_job_etl_transform" {
+  description = "Glue job name — step 2: joins streams+songs, writes KPIs to gold/"
+  value       = aws_glue_job.etl_transform.name
+}
+
+output "glue_job_dynamodb_loader" {
+  description = "Glue job name — step 3: loads gold parquet into DynamoDB"
+  value       = aws_glue_job.dynamodb_loader.name
+}
+
+output "glue_job_archive" {
+  description = "Glue job name — step 4: archives processed raw files"
+  value       = aws_glue_job.archive.name
+}
+
+output "glue_job_kpi_aggregation" {
+  description = "Glue job name — standalone: KPI aggregation from silver/enriched_streams"
+  value       = aws_glue_job.kpi_aggregation.name
+}
+
+output "glue_workflow_name" {
+  description = "Glue Workflow name — trigger via console or: aws glue start-workflow-run --name <value>"
+  value       = aws_glue_workflow.pipeline.name
+}
