@@ -64,12 +64,13 @@ def assembleGenreKpis(enrichedDF) -> DataFrame:
 
 
 def computeTopSongsPerGenre(enrichedDF) -> DataFrame:
-    rankWindow = Window.partitionBy("stream_date", "track_genre").orderBy(F.desc("play_count"))
+    # row_number() guarantees unique ranks even when play_count values are tied
+    rankWindow = Window.partitionBy("stream_date", "track_genre").orderBy(F.desc("play_count"), "track_id")
     return (
         enrichedDF
         .groupBy("stream_date", "track_genre", "track_id", "track_name")
         .agg(F.count("*").alias("play_count"))
-        .withColumn("rank", F.rank().over(rankWindow))
+        .withColumn("rank", F.row_number().over(rankWindow))
         .filter(F.col("rank") <= TOP_SONGS_RANK)
         .withColumn(
             "genre_date",
@@ -79,10 +80,11 @@ def computeTopSongsPerGenre(enrichedDF) -> DataFrame:
 
 
 def computeTopGenresPerDay(genreKpisDF) -> DataFrame:
-    rankWindow = Window.partitionBy("stream_date").orderBy(F.desc("listen_count"))
+    # row_number() guarantees unique ranks even when listen_count values are tied
+    rankWindow = Window.partitionBy("stream_date").orderBy(F.desc("listen_count"), "track_genre")
     return (
         genreKpisDF
-        .withColumn("rank", F.rank().over(rankWindow))
+        .withColumn("rank", F.row_number().over(rankWindow))
         .filter(F.col("rank") <= TOP_GENRES_RANK)
         .select("stream_date", "track_genre", "listen_count", "rank")
         .withColumnRenamed("stream_date", "date")
