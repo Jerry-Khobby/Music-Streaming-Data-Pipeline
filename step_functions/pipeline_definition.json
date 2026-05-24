@@ -1,0 +1,120 @@
+{
+  "Comment": "Music Streaming ETL Pipeline — orchestrates 5 Glue jobs in sequence",
+  "StartAt": "ValidateData",
+  "States": {
+
+    "ValidateData": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Comment": "Checks all raw catalog tables exist, are non-empty, and have required columns",
+      "Parameters": {
+        "JobName": "music-streaming-validation"
+      },
+      "ResultPath": "$.validationResult",
+      "Next": "TransformData",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ]
+    },
+
+    "TransformData": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Comment": "Joins streams + songs on track_id, extracts stream_date — writes enriched_streams to silver/",
+      "Parameters": {
+        "JobName": "music-streaming-etl-transform"
+      },
+      "ResultPath": "$.transformResult",
+      "Next": "AggregateKPIs",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ]
+    },
+
+    "AggregateKPIs": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Comment": "Reads silver/enriched_streams — computes genre_kpis, top_songs, top_genres — writes to gold/",
+      "Parameters": {
+        "JobName": "music-streaming-kpi-aggregation"
+      },
+      "ResultPath": "$.kpiResult",
+      "Next": "LoadDynamoDB",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ]
+    },
+
+    "LoadDynamoDB": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Comment": "Reads gold/ parquet — batch-writes genre_kpis, top_songs, top_genres into DynamoDB",
+      "Parameters": {
+        "JobName": "music-streaming-dynamodb-loader"
+      },
+      "ResultPath": "$.dynamoResult",
+      "Next": "ArchiveFiles",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ]
+    },
+
+    "ArchiveFiles": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Comment": "Copies processed streams/ files to archive bucket then deletes originals from raw bucket",
+      "Parameters": {
+        "JobName": "music-streaming-archive"
+      },
+      "ResultPath": "$.archiveResult",
+      "Next": "PipelineSucceeded",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ]
+    },
+
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Comment": "Publishes error details to SNS — the Terraform-managed topic ARN is injected at deploy time",
+      "Parameters": {
+        "TopicArn": "<sns_topic_arn_injected_by_terraform>",
+        "Subject": "Music Streaming Pipeline FAILED",
+        "Message.$": "States.Format('Pipeline failed. Error details: {}', States.JsonToString($.error))"
+      },
+      "ResultPath": "$.snsResult",
+      "Next": "PipelineFailed"
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineError",
+      "Cause": "One or more pipeline steps failed — check CloudWatch logs and SNS alert for details"
+    },
+
+    "PipelineSucceeded": {
+      "Type": "Succeed"
+    }
+
+  }
+}

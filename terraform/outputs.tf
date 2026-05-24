@@ -112,3 +112,42 @@ output "glue_workflow_name" {
   description = "Glue Workflow name — trigger via console or: aws glue start-workflow-run --name <value>"
   value       = aws_glue_workflow.pipeline.name
 }
+
+# ── STEP FUNCTIONS ────────────────────────────────────────────
+
+output "state_machine_arn" {
+  description = "ARN of the Step Functions state machine"
+  value       = aws_sfn_state_machine.pipeline.arn
+}
+
+output "state_machine_name" {
+  description = "Name of the Step Functions state machine"
+  value       = aws_sfn_state_machine.pipeline.name
+}
+
+# ── MESSAGING ─────────────────────────────────────────────────
+
+output "sns_alerts_topic_arn" {
+  description = "SNS topic ARN — subscribe an email: aws sns subscribe --topic-arn <arn> --protocol email --notification-endpoint you@example.com"
+  value       = aws_sns_topic.pipeline_alerts.arn
+}
+
+output "sqs_pipeline_events_url" {
+  description = "SQS queue URL that receives S3 ObjectCreated events"
+  value       = aws_sqs_queue.pipeline_events.url
+}
+
+output "sqs_pipeline_dlq_url" {
+  description = "SQS dead-letter queue URL for unprocessable events"
+  value       = aws_sqs_queue.pipeline_dlq.url
+}
+
+output "eventbridge_rule_name" {
+  description = "EventBridge rule that watches for new stream files in S3"
+  value       = aws_cloudwatch_event_rule.streams_uploaded.name
+}
+
+output "eventbridge_pipe_name" {
+  description = "EventBridge Pipe that connects SQS to Step Functions"
+  value       = aws_pipes_pipe.sqs_to_sfn.name
+}
