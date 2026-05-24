@@ -88,9 +88,9 @@ job.init(args["JOB_NAME"], args)
 goldBase = f"s3://{args['curated_bucket']}/gold"
 region   = args["aws_region"]
 
-genreKpisDF = loadParquet(spark, f"{goldBase}/genre_kpis")
-topSongsDF  = loadParquet(spark, f"{goldBase}/top_songs")
-topGenresDF = loadParquet(spark, f"{goldBase}/top_genres")
+genreKpisDF = loadParquet(spark, f"{goldBase}/genre_kpis").dropDuplicates(["genre_date"])
+topSongsDF  = loadParquet(spark, f"{goldBase}/top_songs").dropDuplicates(["genre_date", "rank"])
+topGenresDF = loadParquet(spark, f"{goldBase}/top_genres").dropDuplicates(["date", "rank"])
 
 loadToDynamo(genreKpisDF, GENRE_KPIS_TABLE, region, buildGenreKpisItem)
 loadToDynamo(topSongsDF,  TOP_SONGS_TABLE,  region, buildTopSongsItem)
