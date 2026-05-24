@@ -24,6 +24,12 @@ resource "aws_s3_bucket_versioning" "raw" {
   }
 }
 
+# Required for EventBridge to receive S3 ObjectCreated events from this bucket
+resource "aws_s3_bucket_notification" "raw_eventbridge" {
+  bucket      = aws_s3_bucket.raw.id
+  eventbridge = true
+}
+
 resource "aws_s3_bucket_server_side_encryption_configuration" "raw" {
   bucket = aws_s3_bucket.raw.id
   rule {
