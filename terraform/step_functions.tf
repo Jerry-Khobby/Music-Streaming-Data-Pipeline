@@ -2,6 +2,10 @@
 #  STEP FUNCTIONS — State machine + IAM role
 #
 #  Execution order:
+#    0. StartRawCrawler    → fires the Glue raw crawler (auto — no manual step needed)
+#       WaitForCrawler     → waits 30 s between polls
+#       CheckCrawlerStatus → reads crawler state via AWS SDK
+#       IsCrawlerReady     → loops back if still RUNNING, proceeds when READY
 #    1. ValidateData       → validation_job        (fails fast if schema is wrong)
 #    2. TransformData      → etl_transform_job     (bronze → silver enriched streams)
 #    3. AggregateKPIs      → kpi_aggregation_job   (silver → gold KPIs)
@@ -39,6 +43,16 @@ data "aws_iam_policy_document" "sfn_permissions" {
       "glue:GetJobRun",
       "glue:GetJobRuns",
       "glue:BatchStopJobRun",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "GlueCrawlerControl"
+    effect = "Allow"
+    actions = [
+      "glue:StartCrawler",
+      "glue:GetCrawler",
     ]
     resources = ["*"]
   }
@@ -91,9 +105,65 @@ resource "aws_iam_role_policy" "sfn_permissions" {
 locals {
   sfn_definition = jsonencode({
     Comment = "Music Streaming ETL Pipeline — orchestrates 5 Glue jobs in sequence"
-    StartAt = "ValidateData"
+    StartAt = "StartRawCrawler"
 
     States = {
+
+      StartRawCrawler = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::aws-sdk:glue:startCrawler"
+        Parameters = {
+          Name = aws_glue_crawler.raw_crawler.name
+        }
+        ResultPath = null
+        Next       = "WaitForCrawler"
+        Catch = [
+          {
+            # Already running is fine — skip to polling
+            ErrorEquals = ["Glue.CrawlerRunningException"]
+            ResultPath  = null
+            Next        = "WaitForCrawler"
+          },
+          {
+            ErrorEquals = ["States.ALL"]
+            ResultPath  = "$.error"
+            Next        = "NotifyFailure"
+          }
+        ]
+      }
+
+      WaitForCrawler = {
+        Type    = "Wait"
+        Seconds = 30
+        Next    = "CheckCrawlerStatus"
+      }
+
+      CheckCrawlerStatus = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::aws-sdk:glue:getCrawler"
+        Parameters = {
+          Name = aws_glue_crawler.raw_crawler.name
+        }
+        ResultPath = "$.crawlerStatus"
+        Next       = "IsCrawlerReady"
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = "$.error"
+          Next        = "NotifyFailure"
+        }]
+      }
+
+      IsCrawlerReady = {
+        Type = "Choice"
+        Choices = [
+          {
+            Variable     = "$.crawlerStatus.Crawler.State"
+            StringEquals = "READY"
+            Next         = "ValidateData"
+          }
+        ]
+        Default = "WaitForCrawler"
+      }
 
       ValidateData = {
         Type     = "Task"
