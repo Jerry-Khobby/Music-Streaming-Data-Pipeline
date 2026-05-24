@@ -1,7 +1,68 @@
 {
   "Comment": "Music Streaming ETL Pipeline — orchestrates 5 Glue jobs in sequence",
-  "StartAt": "ValidateData",
+  "StartAt": "StartRawCrawler",
   "States": {
+
+    "StartRawCrawler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Comment": "Fires the raw crawler to register/refresh songs, streams, users schemas in the Glue Data Catalog",
+      "Parameters": {
+        "Name": "music-streaming-raw-crawler"
+      },
+      "ResultPath": null,
+      "Next": "WaitForCrawler",
+      "Catch": [
+        {
+          "ErrorEquals": ["Glue.CrawlerRunningException"],
+          "Comment": "Already running is fine — skip straight to polling",
+          "ResultPath": null,
+          "Next": "WaitForCrawler"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ]
+    },
+
+    "WaitForCrawler": {
+      "Type": "Wait",
+      "Comment": "Poll every 30 seconds — typical crawler run is 1-2 minutes",
+      "Seconds": 30,
+      "Next": "CheckCrawlerStatus"
+    },
+
+    "CheckCrawlerStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "Parameters": {
+        "Name": "music-streaming-raw-crawler"
+      },
+      "ResultPath": "$.crawlerStatus",
+      "Next": "IsCrawlerReady",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ]
+    },
+
+    "IsCrawlerReady": {
+      "Type": "Choice",
+      "Comment": "Loops back to WaitForCrawler until State == READY",
+      "Choices": [
+        {
+          "Variable": "$.crawlerStatus.Crawler.State",
+          "StringEquals": "READY",
+          "Next": "ValidateData"
+        }
+      ],
+      "Default": "WaitForCrawler"
+    },
 
     "ValidateData": {
       "Type": "Task",
