@@ -105,6 +105,7 @@ if __name__ == "__main__":
     sc = SparkContext()
     glueContext = GlueContext(sc)
     spark = glueContext.spark_session
+    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
     job = Job(glueContext)
     job.init(args["JOB_NAME"], args)
 

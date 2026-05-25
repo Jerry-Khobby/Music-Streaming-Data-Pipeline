@@ -2,9 +2,12 @@
 Tests for glue_jobs/etl_transform_job.py  (Bronze → Silver)
 
 Covers:
-  - buildEnrichedStreams  – join correctness, stream_date derivation, unmatched rows
-  - writeParquet          – write interaction (overwrite mode, partitioning)
-  - SONGS_COLUMNS         – constant integrity
+  - SONGS_COLUMNS            – constant integrity
+  - STREAM_DEDUP_KEY         – constant integrity
+  - buildEnrichedStreams      – join correctness, stream_date derivation, unmatched rows
+  - loadExistingPartitions   – first-run (path missing), date filtering
+  - mergeWithExisting        – accumulates across batches, deduplicates re-delivered events
+  - writeParquet             – write interaction (overwrite mode, partitioning)
 """
 
 import sys

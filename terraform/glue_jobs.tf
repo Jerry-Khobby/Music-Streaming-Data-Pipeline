@@ -85,6 +85,10 @@ resource "aws_glue_job" "validation" {
   number_of_workers = 2
   timeout           = 10 # minutes — validation is fast
 
+  execution_property {
+    max_concurrent_runs = 1
+  }
+
   default_arguments = merge(local.glue_common_args, {
     "--glue_database" = var.glue_database_name
   })
@@ -115,6 +119,10 @@ resource "aws_glue_job" "etl_transform" {
   worker_type       = "G.1X"
   number_of_workers = 2
   timeout           = 30
+
+  execution_property {
+    max_concurrent_runs = 1
+  }
 
   default_arguments = merge(local.glue_common_args, {
     "--glue_database"  = var.glue_database_name
@@ -148,6 +156,10 @@ resource "aws_glue_job" "dynamodb_loader" {
   number_of_workers = 2
   timeout           = 30
 
+  execution_property {
+    max_concurrent_runs = 1
+  }
+
   default_arguments = merge(local.glue_common_args, {
     "--curated_bucket" = aws_s3_bucket.curated.id
     "--aws_region"     = var.aws_region
@@ -179,6 +191,10 @@ resource "aws_glue_job" "archive" {
   worker_type       = "G.1X"
   number_of_workers = 2
   timeout           = 10
+
+  execution_property {
+    max_concurrent_runs = 1
+  }
 
   default_arguments = merge(local.glue_common_args, {
     "--raw_bucket"     = aws_s3_bucket.raw.id
@@ -212,6 +228,10 @@ resource "aws_glue_job" "kpi_aggregation" {
   worker_type       = "G.1X"
   number_of_workers = 2
   timeout           = 30
+
+  execution_property {
+    max_concurrent_runs = 1
+  }
 
   default_arguments = merge(local.glue_common_args, {
     "--curated_bucket" = aws_s3_bucket.curated.id

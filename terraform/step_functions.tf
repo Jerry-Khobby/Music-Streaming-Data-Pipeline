@@ -58,9 +58,9 @@ data "aws_iam_policy_document" "sfn_permissions" {
   }
 
   statement {
-    sid     = "SnsPublish"
-    effect  = "Allow"
-    actions = ["sns:Publish"]
+    sid       = "SnsPublish"
+    effect    = "Allow"
+    actions   = ["sns:Publish"]
     resources = [aws_sns_topic.pipeline_alerts.arn]
   }
 
@@ -105,9 +105,17 @@ resource "aws_iam_role_policy" "sfn_permissions" {
 locals {
   sfn_definition = jsonencode({
     Comment = "Music Streaming ETL Pipeline — orchestrates 5 Glue jobs in sequence"
-    StartAt = "StartRawCrawler"
+    StartAt = "NormalizeInput"
 
     States = {
+
+      # EventBridge Pipes delivers the SQS record as an array [{}].
+      # $[0] unwraps it into a plain object so all ResultPath writes succeed.
+      NormalizeInput = {
+        Type      = "Pass"
+        InputPath = "$[0]"
+        Next      = "StartRawCrawler"
+      }
 
       StartRawCrawler = {
         Type     = "Task"
@@ -244,8 +252,8 @@ locals {
         Type     = "Task"
         Resource = "arn:aws:states:::sns:publish"
         Parameters = {
-          TopicArn   = aws_sns_topic.pipeline_alerts.arn
-          Subject    = "Music Streaming Pipeline FAILED"
+          TopicArn    = aws_sns_topic.pipeline_alerts.arn
+          Subject     = "Music Streaming Pipeline FAILED"
           "Message.$" = "States.Format('Pipeline failed. Error details: {}', States.JsonToString($.error))"
         }
         ResultPath = "$.snsResult"
@@ -277,7 +285,7 @@ resource "aws_sfn_state_machine" "pipeline" {
   logging_configuration {
     log_destination        = "${aws_cloudwatch_log_group.step_functions.arn}:*"
     include_execution_data = true
-    level                  = "ERROR"
+    level                  = "ALL"
   }
 
   tracing_configuration {
