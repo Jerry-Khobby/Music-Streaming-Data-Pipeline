@@ -1,41 +1,81 @@
 # IAM Roles and Policies
 
-## What IAM Roles and Policies Are
+## 1. Core Concepts
 
-AWS Identity and Access Management (IAM) controls who or what can act inside your AWS account and what those actors are allowed to do. Two constructs do this work:
+### What IAM Is and Why It Exists
 
-**A role** is an identity that an AWS service can temporarily assume. It is not a user. It has no password and no long-term credentials. When a service like Glue or Step Functions needs to call another AWS API, it assumes a role and receives short-lived credentials automatically. Once the task is done, the credentials expire.
+AWS Identity and Access Management (IAM) is the authorization layer that sits in front of every AWS API call. Every action taken in AWS — starting a Glue job, writing a file to S3, publishing to SNS, starting a Step Functions execution — passes through IAM before it is permitted or denied. IAM answers two questions: who is making this request, and are they allowed to do it?
 
-**A policy** is a JSON document attached to a role that lists exactly which API actions are allowed or denied on which resources. Without a policy, a role can do nothing. With a policy, it can do only what the policy explicitly permits.
+In a data pipeline, services talk to other services constantly. A Glue job reads from S3. Step Functions starts Glue jobs. An EventBridge Pipe consumes from SQS. None of these services can act on their own authority. Each one must assume a role that carries the permissions it needs. IAM is the mechanism that makes this controlled cross-service communication possible without any hardcoded credentials.
 
-Every role in this project follows the same two-part structure:
+### Roles vs Users vs Groups
 
-1. A **trust policy** that declares which service is allowed to assume the role.
-2. One or more **permission policies** that declare what that service can do once it has assumed the role.
+An IAM **user** represents a human or a long-lived machine identity with permanent credentials. An IAM **group** is a collection of users sharing the same policies. An IAM **role** is a temporary identity that a service, a user, or another account assumes for a specific purpose. When a service assumes a role, AWS Security Token Service (STS) issues short-lived credentials that expire automatically. No static access keys exist, which eliminates the most common credential leak vector.
+
+This project uses only roles — never users or groups — because all actors are AWS services, not humans.
+
+### Identity-Based Policies vs Resource-Based Policies
+
+There are two distinct policy types in play in this project:
+
+**Identity-based policies** are attached to a role and travel with that role. They say: this role is allowed to perform these actions. The Glue role carrying `AmazonS3FullAccess` is an example.
+
+**Resource-based policies** are attached to a resource and control who can interact with that resource from outside the role system. The SQS queue policy and the SNS topic policy in this project are examples. For an API call to succeed across a service boundary, both the identity-based policy on the caller and the resource-based policy on the target must permit the action.
+
+### Trust Policies
+
+Every role has a trust policy — a special JSON document that defines which principal is allowed to call `sts:AssumeRole` on the role. Without a trust policy, a role cannot be assumed by anything and is useless. Every role in this project has a trust policy that names exactly one AWS service principal. This means the role can only ever be assumed by that one service and nothing else in the account.
+
+### Inline Policies vs Managed Policies
+
+**Managed policies** are standalone IAM policies created and versioned independently of any role. AWS publishes a library of managed policies. Attaching `AmazonS3FullAccess` to a role means the role inherits that policy's permissions. Managed policies are reusable but their permission boundaries are fixed by AWS.
+
+**Inline policies** are written directly into a role and exist only as long as that role exists. They are used in this project for the Step Functions and EventBridge Pipes roles because those policies need to reference specific resource ARNs that are only known after Terraform provisions the infrastructure — for example, the exact ARN of the SNS topic or the SQS queue.
+
+### The STS AssumeRole Flow
+
+When a Glue job starts, the sequence is:
+
+1. The Glue service contacts AWS STS and presents the role ARN configured on the job.
+2. STS checks the trust policy on that role. Because `glue.amazonaws.com` is the configured principal and Glue is the caller, the check passes.
+3. STS issues a set of temporary credentials: an access key ID, a secret access key, and a session token. These expire after a maximum of 12 hours.
+4. Glue uses those temporary credentials to make API calls on the job's behalf.
+5. Every API call is evaluated against the permission policies attached to the role.
+
+This flow repeats for Step Functions, EventBridge Pipes, and every other service in the pipeline.
 
 ---
 
-## The Least Privilege Principle
+## 2. The Least Privilege Principle
 
-The least privilege principle means granting only the permissions required for a task to succeed and nothing more. A Glue job that reads from S3 and writes to DynamoDB does not need permission to create EC2 instances or delete IAM users. Scoping permissions tightly limits the blast radius if credentials are ever misused or if a job is accidentally misconfigured.
+### What It Means
 
-This project applies least privilege in the following ways:
+Least privilege means granting an identity exactly the permissions it needs to perform its task and nothing more. An identity with excess permissions creates unnecessary risk: if the identity is compromised, a misconfigured job runs amok, or a bug introduces unintended behavior, the blast radius is proportional to the permissions it holds.
 
-- Each of the three roles in the project is scoped to a specific service and a specific set of tasks.
-- Permission policies are grouped by logical concern using named `sid` (statement ID) blocks, making it clear why each permission exists.
-- Where a resource ARN is known at deploy time, it is used directly rather than a wildcard. Where AWS requires a wildcard (Glue job ARNs for the `.sync` integration, CloudWatch Logs delivery APIs), that is noted below.
+### How This Project Applies It
+
+**Separate roles for separate services.** Rather than one omnipotent role shared across everything, this project has three distinct roles — one for Glue, one for Step Functions, one for EventBridge Pipes. Each role can only be assumed by its specific service. A compromised Glue job cannot assume the Step Functions role or call `states:StartExecution`. A misconfigured EventBridge Pipe cannot call `glue:StartJobRun` directly.
+
+**Statement IDs communicate intent.** Every inline policy statement carries a `sid` (statement ID) such as `GlueJobControl`, `GlueCrawlerControl`, `SqsConsume`, and `StartExecution`. These names document why each permission group exists and make auditing the policy straightforward.
+
+**Resource scoping where ARNs are known.** The Step Functions role's `SnsPublish` statement is scoped to the single SNS topic ARN. The EventBridge Pipes role's `SqsConsume` and `StartExecution` statements are each scoped to a single ARN. These roles cannot affect any other resource of those types in the account.
+
+**Wildcards only where AWS requires them.** The Glue job control statement uses `resources = ["*"]` because the Step Functions `.sync` integration constructs job run ARNs dynamically at runtime and cannot be pre-scoped. The CloudWatch Logs delivery statements also require wildcards because the delivery management APIs are account-scoped. These exceptions are deliberate and documented rather than being a result of convenience.
+
+**Managed policies are an acknowledged trade-off.** The Glue role uses `AmazonS3FullAccess` and `AmazonDynamoDBFullAccess` — AWS-managed policies that are broader than strictly necessary. This is an accepted trade-off for a development pipeline where all three buckets and all three DynamoDB tables belong to the same project. In a production environment with shared infrastructure, these would be replaced with custom inline policies scoped to the six specific resource ARNs.
 
 ---
 
-## Role 1 — glue-pipeline-role
+## 3. IAM Role 1 — glue-pipeline-role
 
 **Terraform resource:** `aws_iam_role.glue_role`
-**Role name:** `glue-pipeline-role`
+**Role name:** controlled by `var.glue_role_name`, defaults to `glue-pipeline-role`
 **Defined in:** `main.tf`
+**Used by:** all five Glue jobs and both Glue crawlers
 
-### Purpose
+### What This Role Does
 
-This role is assumed by every AWS Glue job in the pipeline. When Glue starts a job run, it assumes this role to obtain the credentials needed to read from S3, write to S3, write to DynamoDB, and emit logs to CloudWatch.
+This is the execution identity for everything that runs inside the Glue service — the validation job, the ETL transform job, the KPI aggregation job, the DynamoDB loader, the archive job, the raw crawler, and the curated crawler. When any of these run, they operate under this role's identity.
 
 ### Trust Policy
 
@@ -49,41 +89,79 @@ This role is assumed by every AWS Glue job in the pipeline. When Glue starts a j
 }
 ```
 
-The trust policy names `glue.amazonaws.com` as the only principal allowed to assume this role. No human user, no other service, and no other account can assume it.
+The trust policy is defined as a `data "aws_iam_policy_document"` block in Terraform, which generates the JSON. Only the Glue service can assume this role. A human developer, a Lambda function, an EC2 instance, or any other service in the account cannot assume it.
 
-### Attached Policies
+### Why Both Crawlers Use the Same Role as the Jobs
 
-Four AWS managed policies are attached using `aws_iam_role_policy_attachment`:
+Both `aws_glue_crawler.raw_crawler` and `aws_glue_crawler.curated_crawler` reference `aws_iam_role.glue_role.arn` in their `role` attribute. Glue crawlers are Glue-service resources just like Glue jobs. They need the same trust principal (`glue.amazonaws.com`) and the same S3 read permissions to traverse bucket prefixes and infer schemas. Because the crawlers and jobs all touch the same S3 buckets and the same Glue Data Catalog, using one shared role is correct and avoids maintaining duplicate IAM configurations.
+
+### Attached Managed Policies
 
 **AWSGlueServiceRole**
-Grants the baseline permissions Glue requires to function: reading job definitions from the Glue Data Catalog, writing job metrics, and accessing the Glue control plane. Without this policy, Glue cannot start or report the status of a job run.
+ARN: `arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole`
+
+This is the baseline policy published by AWS for Glue service roles. It grants permissions for Glue to manage its own metadata operations: reading job and crawler definitions from the Glue Data Catalog, writing job metrics and status, tagging resources, and working with Glue connections. Without this policy, the Glue service cannot perform its internal bookkeeping and job runs fail at startup before any user code executes.
 
 **AmazonS3FullAccess**
-Grants read and write access across all S3 buckets in the account. The Glue jobs in this pipeline read raw CSV files from the bronze bucket, write enriched Parquet files to the silver layer, write aggregated KPI Parquet files to the gold layer, and the archive job copies files between the raw and archive buckets. All of these operations require broad S3 access. In a production environment with strict data boundaries, this would be replaced with a custom policy scoped to the three specific bucket ARNs.
+ARN: `arn:aws:iam::aws:policy/AmazonS3FullAccess`
+
+Every Glue job in this pipeline interacts with S3 in some way:
+
+- `validation_job` reads table definitions that the crawler registered from S3 paths.
+- `etl_transform_job` reads raw CSV data from the bronze bucket (`streams/`, `songs/`) and writes enriched Parquet files to the silver layer of the curated bucket.
+- `kpi_aggregation_job` reads from silver and writes KPI Parquet files to the gold layer.
+- `dynamodb_loader` reads from the gold layer.
+- `archive_job` copies files from the raw bucket's `streams/` prefix to the archive bucket and then deletes them from the raw bucket.
+- Both crawlers traverse S3 prefixes to infer schemas.
+
+The operations span three different buckets across read, write, copy, and delete verbs. `AmazonS3FullAccess` covers all of them. In production, this would be replaced with a custom policy granting `s3:GetObject` and `s3:ListBucket` on the raw and curated buckets, and `s3:PutObject`, `s3:DeleteObject`, and `s3:GetObject` on the archive bucket.
 
 **AmazonDynamoDBFullAccess**
-Grants read and write access to all DynamoDB tables. The `dynamodb_loader` job performs `BatchWriteItem` operations across three tables: `genre_kpis`, `top_songs`, and `top_genres`. Full DynamoDB access is used here for simplicity. In production this would be scoped to those three table ARNs with only `dynamodb:BatchWriteItem` and `dynamodb:PutItem` allowed.
+ARN: `arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess`
+
+The `dynamodb_loader` job writes to three DynamoDB tables using `boto3`'s `batch_writer`, which internally calls `BatchWriteItem`. The full access managed policy is used here because `BatchWriteItem` also requires `PutItem` and `DeleteItem` at the API level depending on the batch content. In production this would be a custom policy granting only `dynamodb:BatchWriteItem` and `dynamodb:PutItem` scoped to the three table ARNs: `genre_kpis`, `top_songs`, and `top_genres`.
 
 **CloudWatchLogsFullAccess**
-Grants the ability to create and write to CloudWatch log streams. All five Glue jobs are configured with `--enable-continuous-cloudwatch-log`, which streams driver and executor logs in real time to the `/aws/glue/music-streaming` log group. Without this policy, logs would not appear in CloudWatch and debugging job failures would require downloading logs from S3 after the job completes.
+ARN: `arn:aws:iam::aws:policy/CloudWatchLogsFullAccess`
 
-### Why One Shared Role for All Glue Jobs
+All five Glue jobs are configured with two job arguments that activate continuous logging:
 
-All five Glue jobs share a single role rather than one role per job. This is a deliberate trade-off. Because every job in this pipeline touches the same three S3 buckets and the same DynamoDB tables, their permission requirements are identical. Creating five separate roles with identical permissions would add infrastructure complexity without adding security value. The shared role is justified because the jobs form a single pipeline with unified data ownership.
+```
+--enable-continuous-cloudwatch-log = true
+--continuous-log-logGroup          = /aws/glue/music-streaming
+```
+
+Continuous logging streams driver and executor output to CloudWatch in real time, rather than only making logs available after a job completes. This is critical for debugging long-running PySpark jobs. The `CloudWatchLogsFullAccess` policy grants the Glue executor the ability to create log streams under the log group and push log events to them.
+
+### How the Role Is Referenced Across Resources
+
+```
+aws_iam_role.glue_role.arn
+  → aws_glue_job.validation.role_arn
+  → aws_glue_job.etl_transform.role_arn
+  → aws_glue_job.kpi_aggregation.role_arn
+  → aws_glue_job.dynamodb_loader.role_arn
+  → aws_glue_job.archive.role_arn
+  → aws_glue_crawler.raw_crawler.role
+  → aws_glue_crawler.curated_crawler.role
+```
+
+Eight Glue resources reference the same role ARN. Terraform manages this as a dependency — if the role is not yet created, none of these resources can be provisioned.
 
 ---
 
-## Role 2 — music-streaming-sfn-role
+## 4. IAM Role 2 — music-streaming-sfn-role
 
 **Terraform resource:** `aws_iam_role.sfn_role`
 **Role name:** `music-streaming-sfn-role`
 **Defined in:** `step_functions.tf`
+**Used by:** the Step Functions state machine `music-streaming-pipeline`
 
-### Purpose
+### Role Purpose
 
-This role is assumed by the Step Functions state machine. Step Functions itself does not process data. Its job is to orchestrate other services: starting Glue crawlers, starting Glue jobs, polling their status, publishing SNS notifications, and writing execution logs to CloudWatch. Every API call the state machine makes on behalf of the pipeline goes through this role.
+This role is the execution identity for the Step Functions state machine. Step Functions is an orchestrator — it does not process data itself. Instead it calls other AWS services on the pipeline's behalf. Every API call the state machine makes — starting a Glue crawler, starting a Glue job, publishing to SNS, writing execution logs — happens under this role's identity.
 
-### Trust Policy
+### Step Functions Trust Policy
 
 ```json
 {
@@ -95,69 +173,87 @@ This role is assumed by the Step Functions state machine. Step Functions itself 
 }
 ```
 
-Only the Step Functions service can assume this role.
+Only the Step Functions service can assume this role. The Glue service, EventBridge, and all other services in the account cannot.
 
-### Permission Policy Statements
+### Step Functions Inline Permission Policy
 
-The inline policy attached via `aws_iam_role_policy.sfn_permissions` contains four named statements:
+The policy is defined as a `data "aws_iam_policy_document"` block and attached as an inline policy via `aws_iam_role_policy.sfn_permissions`. It contains five named statements:
 
-**GlueJobControl**
-```
-glue:StartJobRun
-glue:GetJobRun
-glue:GetJobRuns
-glue:BatchStopJobRun
-```
-The `.sync` resource integration (`arn:aws:states:::glue:startJobRun.sync`) causes Step Functions to poll the Glue API internally until the job reaches a terminal state. This requires `StartJobRun` to launch the job and `GetJobRun` to check its status. `BatchStopJobRun` allows Step Functions to cancel a running job if the state machine execution is aborted. The resource is `*` because the Glue optimised integration requires it — the internal polling mechanism constructs job run ARNs dynamically and cannot be pre-scoped.
+#### Statement: GlueJobControl
 
-**GlueCrawlerControl**
 ```
-glue:StartCrawler
-glue:GetCrawler
+Actions:  glue:StartJobRun
+          glue:GetJobRun
+          glue:GetJobRuns
+          glue:BatchStopJobRun
+Resource: *
 ```
-The `StartRawCrawler` state uses the AWS SDK integration (`arn:aws:states:::aws-sdk:glue:startCrawler`) to fire the raw crawler at the start of every pipeline execution. The `CheckCrawlerStatus` state uses `glue:GetCrawler` to poll the crawler's `State` field every 30 seconds until it returns `READY`. These two actions are the minimum required to automate the crawler within the state machine.
 
-**SnsPublish**
-```
-sns:Publish  →  scoped to aws_sns_topic.pipeline_alerts.arn only
-```
-The `NotifyFailure` state publishes a failure message to the SNS alerts topic when any pipeline step fails. The resource is scoped to the exact ARN of the alerts topic. The Step Functions role cannot publish to any other SNS topic in the account.
+When the state machine reaches `ValidateData`, `TransformData`, `AggregateKPIs`, `LoadDynamoDB`, or `ArchiveFiles`, it calls `glue:StartJobRun` to launch the job. The `.sync` resource integration (`arn:aws:states:::glue:startJobRun.sync`) means Step Functions then polls `glue:GetJobRun` internally every few seconds until the job reaches a terminal state (`SUCCEEDED`, `FAILED`, `STOPPED`, or `TIMEOUT`). `glue:BatchStopJobRun` is required to cancel running jobs if the state machine execution itself is aborted or times out.
 
-**CloudWatchLogs**
-```
-logs:CreateLogDelivery
-logs:GetLogDelivery
-logs:UpdateLogDelivery
-logs:DeleteLogDelivery
-logs:ListLogDeliveries
-logs:PutResourcePolicy
-logs:DescribeResourcePolicies
-logs:DescribeLogGroups
-```
-The state machine is configured with `logging_configuration` set to `ERROR` level, sending execution event data to the `/aws/states/music-streaming` CloudWatch log group. AWS requires all eight of these log delivery management actions for the logging integration to function. They cannot be scoped to a specific log group ARN because the delivery management APIs operate at the account level.
+The resource must be `*` because the `.sync` integration constructs job run ARNs at runtime by appending a dynamically generated run ID. There is no way to pre-declare those ARNs in a policy.
 
-**XRayTracing**
+#### Statement: GlueCrawlerControl
+
 ```
-xray:PutTraceSegments
-xray:PutTelemetryRecords
-xray:GetSamplingRules
-xray:GetSamplingTargets
+Actions:  glue:StartCrawler
+          glue:GetCrawler
+Resource: *
 ```
-The state machine has `tracing_configuration` enabled, which sends execution segments to AWS X-Ray. This enables distributed tracing across the Step Functions execution and any downstream Glue job logs that also emit X-Ray segments. These four actions are the minimum required by the X-Ray SDK.
+
+The `StartRawCrawler` state uses the AWS SDK integration (`arn:aws:states:::aws-sdk:glue:startCrawler`) to fire the raw crawler at the beginning of every pipeline execution. The `CheckCrawlerStatus` state polls `glue:GetCrawler` every 30 seconds, reading the `Crawler.State` field to determine when the crawler reaches `READY`. These two actions are the exact minimum required to automate the crawler inside the state machine without a separate trigger or manual intervention.
+
+#### Statement: SnsPublish
+
+```
+Actions:  sns:Publish
+Resource: aws_sns_topic.pipeline_alerts.arn  (exact ARN)
+```
+
+The `NotifyFailure` state publishes a failure message to the alerts SNS topic whenever any pipeline step raises an error. This is the only statement in the entire project where the resource is scoped to a specific ARN at the statement level. The Step Functions role cannot publish to any other SNS topic in the account.
+
+#### Statement: CloudWatchLogs
+
+```
+Actions:  logs:CreateLogDelivery
+          logs:GetLogDelivery
+          logs:UpdateLogDelivery
+          logs:DeleteLogDelivery
+          logs:ListLogDeliveries
+          logs:PutResourcePolicy
+          logs:DescribeResourcePolicies
+          logs:DescribeLogGroups
+Resource: *
+```
+
+The state machine is configured with `logging_configuration` at `ERROR` level, directing execution event data to the `/aws/states/music-streaming` CloudWatch log group with `include_execution_data = true`. AWS requires all eight of these log delivery management actions for the Step Functions logging integration to configure itself. These APIs operate at the account level and cannot be scoped to a specific log group ARN — AWS enforces this requirement and the resource must be `*`.
+
+#### Statement: XRayTracing
+
+```
+Actions:  xray:PutTraceSegments
+          xray:PutTelemetryRecords
+          xray:GetSamplingRules
+          xray:GetSamplingTargets
+Resource: *
+```
+
+The state machine has `tracing_configuration` enabled with X-Ray. This sends execution segments to AWS X-Ray, enabling distributed tracing across the full pipeline execution timeline. You can visualize exactly how long each state took, where latency occurred, and which state failed — all in the X-Ray service map. These four actions are the minimum required by the X-Ray SDK embedded in the Step Functions runtime.
 
 ---
 
-## Role 3 — music-streaming-pipes-role
+## 5. IAM Role 3 — music-streaming-pipes-role
 
 **Terraform resource:** `aws_iam_role.pipes_role`
 **Role name:** `music-streaming-pipes-role`
 **Defined in:** `messaging.tf`
+**Used by:** the EventBridge Pipe `music-streaming-sqs-to-sfn`
 
-### Purpose
+### Pipes Role Purpose
 
-This role is assumed by the EventBridge Pipe that connects the SQS queue to the Step Functions state machine. The Pipe's job is narrow: poll the SQS queue for S3 ObjectCreated events, consume each message, and call `StartExecution` on the state machine. It requires no access to S3, DynamoDB, Glue, or any other service.
+This is the narrowest role in the project. EventBridge Pipes is the bridge between the SQS queue and the Step Functions state machine. Its only job is to poll the queue for messages and call `StartExecution` on the state machine when one arrives. It needs no access to S3, DynamoDB, Glue, SNS, or any other service.
 
-### Trust Policy
+### Pipes Trust Policy
 
 ```json
 {
@@ -169,56 +265,142 @@ This role is assumed by the EventBridge Pipe that connects the SQS queue to the 
 }
 ```
 
-Only EventBridge Pipes can assume this role.
+Only the EventBridge Pipes service can assume this role.
 
-### Permission Policy Statements
+### Pipes Inline Permission Policy
 
-The inline policy attached via `aws_iam_role_policy.pipes_permissions` contains two named statements:
+The policy contains exactly two statements:
 
-**SqsConsume**
-```
-sqs:ReceiveMessage    →  scoped to pipeline_events queue ARN only
-sqs:DeleteMessage     →  scoped to pipeline_events queue ARN only
-sqs:GetQueueAttributes →  scoped to pipeline_events queue ARN only
-```
-EventBridge Pipes uses long-polling to read messages from the SQS queue. `ReceiveMessage` fetches the message, `DeleteMessage` removes it after successful processing so it is not delivered twice, and `GetQueueAttributes` lets the Pipe read the queue configuration. All three are scoped to the single pipeline events queue ARN. The Pipe cannot touch the DLQ or any other queue in the account.
+#### Statement: SqsConsume
 
-**StartExecution**
 ```
-states:StartExecution  →  scoped to pipeline state machine ARN only
+Actions:  sqs:ReceiveMessage
+          sqs:DeleteMessage
+          sqs:GetQueueAttributes
+Resource: aws_sqs_queue.pipeline_events.arn  (exact ARN)
 ```
-Once a message is received from SQS, the Pipe calls `StartExecution` on the state machine to begin a pipeline run. The resource is the exact ARN of the `music-streaming-pipeline` state machine. The Pipe cannot start any other state machine in the account.
+
+EventBridge Pipes uses long-polling to continuously check the queue for messages. `sqs:ReceiveMessage` fetches up to one message at a time (configured with `batch_size = 1`). `sqs:DeleteMessage` removes the message after it has been successfully forwarded to Step Functions, preventing it from being redelivered. `sqs:GetQueueAttributes` allows the Pipe to read the queue's visibility timeout and other configuration attributes needed to manage polling behavior.
+
+All three actions are scoped to the exact ARN of the `music-streaming-pipeline-events` queue. The Pipes role cannot read from the DLQ or any other SQS queue in the account.
+
+#### Statement: StartExecution
+
+```
+Actions:  states:StartExecution
+Resource: aws_sfn_state_machine.pipeline.arn  (exact ARN)
+```
+
+After consuming a message from SQS, the Pipe calls `states:StartExecution` to begin a pipeline run. The resource is scoped to the exact ARN of the `music-streaming-pipeline` state machine. The Pipes role cannot start any other state machine in the account. It also cannot stop, describe, or list executions — it can only start new ones.
 
 ---
 
-## Resource-Based Policies
+## 6. Resource-Based Policies
 
-In addition to the three IAM roles, two resource-based policies control which services can send messages to shared resources:
+Resource-based policies are not attached to roles. They are attached to resources and define which external identities can interact with those resources. This project has two resource-based policies.
 
-**SQS queue policy — pipeline_events**
-Allows `events.amazonaws.com` (the EventBridge service) to call `sqs:SendMessage` on the pipeline events queue. The condition `aws:SourceArn` restricts this to messages originating specifically from the `music-streaming-streams-uploaded` EventBridge rule. Without this condition, any EventBridge rule in the account could send messages to this queue.
+### SQS Queue Policy — pipeline_events
 
-**SNS topic policy — pipeline_alerts**
-Allows `states.amazonaws.com` (the Step Functions service) to call `sns:Publish` on the alerts topic. This permission exists in addition to the `SnsPublish` statement in the Step Functions role policy because SNS evaluates both the identity-based policy on the caller and the resource-based policy on the topic. Both must allow the action for it to succeed.
+**Terraform resource:** `aws_sqs_queue_policy.pipeline_events`
+**Attached to:** `aws_sqs_queue.pipeline_events`
+
+```json
+{
+  "Sid": "AllowEventBridgeSend",
+  "Effect": "Allow",
+  "Principal": { "Service": "events.amazonaws.com" },
+  "Action": "sqs:SendMessage",
+  "Resource": "<queue-arn>",
+  "Condition": {
+    "ArnEquals": {
+      "aws:SourceArn": "<eventbridge-rule-arn>"
+    }
+  }
+}
+```
+
+This policy allows the EventBridge service to call `sqs:SendMessage` on the pipeline events queue. Without it, EventBridge cannot deliver events to SQS regardless of any identity-based permissions, because SQS enforces its queue policy independently.
+
+The condition `aws:SourceArn` scoped to the specific EventBridge rule ARN is a critical security detail. Without it, any EventBridge rule in the account — including rules created by other teams or services — could send messages to this queue and potentially trigger unintended pipeline executions. The condition ensures that only the `music-streaming-streams-uploaded` rule can write to this queue.
+
+### SNS Topic Policy — pipeline_alerts
+
+**Terraform resource:** `aws_sns_topic_policy.pipeline_alerts`
+**Attached to:** `aws_sns_topic.pipeline_alerts`
+
+```json
+{
+  "Sid": "AllowStepFunctionsPublish",
+  "Effect": "Allow",
+  "Principal": { "Service": "states.amazonaws.com" },
+  "Action": "sns:Publish",
+  "Resource": "<topic-arn>"
+}
+```
+
+This policy allows the Step Functions service to publish to the alerts SNS topic. SNS evaluates both the caller's identity-based policy and the topic's resource-based policy. The Step Functions role already carries `sns:Publish` permission via its inline policy. However, SNS also requires the topic itself to permit the caller. Both must say yes for the publish to succeed. The resource-based policy on the topic is the second half of that handshake.
 
 ---
 
-## Summary Table
+## 7. The Complete IAM Map
 
-| Role | Assumed by | Key permissions | Resource scope |
-|---|---|---|---|
-| `glue-pipeline-role` | `glue.amazonaws.com` | S3 read/write, DynamoDB write, CloudWatch Logs | All buckets and tables (managed policies) |
-| `music-streaming-sfn-role` | `states.amazonaws.com` | Glue job control, crawler control, SNS publish, logs, X-Ray | SNS scoped to alerts topic ARN; Glue requires wildcard |
-| `music-streaming-pipes-role` | `pipes.amazonaws.com` | SQS consume, Step Functions start | Scoped to pipeline queue ARN and state machine ARN |
+The diagram below shows every IAM boundary crossed during a single pipeline run, from S3 upload to DynamoDB write.
+
+```
+S3 ObjectCreated event
+       |
+       | [EventBridge rule evaluates event pattern — no IAM role needed here]
+       |
+       v
+SQS pipeline_events queue
+       |
+       | [SQS queue policy: allows events.amazonaws.com via ArnEquals condition]
+       |
+       v
+EventBridge Pipe (music-streaming-pipes-role)
+  - sqs:ReceiveMessage    \
+  - sqs:DeleteMessage      > SqsConsume statement, scoped to queue ARN
+  - sqs:GetQueueAttributes/
+  - states:StartExecution  > StartExecution statement, scoped to state machine ARN
+       |
+       v
+Step Functions state machine (music-streaming-sfn-role)
+  - glue:StartCrawler   \
+  - glue:GetCrawler      > GlueCrawlerControl statement
+       |
+  [crawler runs under glue-pipeline-role]
+       |
+  - glue:StartJobRun    \
+  - glue:GetJobRun       > GlueJobControl statement (x5 for each Glue job)
+  - glue:BatchStopJobRun/
+       |
+       | [on any failure]
+       |
+  - sns:Publish           > SnsPublish statement, scoped to topic ARN
+                          > SNS topic policy: allows states.amazonaws.com
+       |
+       v
+Each Glue job (glue-pipeline-role)
+  - S3 read/write/delete    > AmazonS3FullAccess (managed)
+  - DynamoDB BatchWriteItem > AmazonDynamoDBFullAccess (managed)
+  - CloudWatch Logs write   > CloudWatchLogsFullAccess (managed)
+  - Glue catalog access     > AWSGlueServiceRole (managed)
+```
 
 ---
 
-## How the Roles Connect During a Pipeline Run
+## 8. Best Practices Applied in This Project
 
-When a new file lands in S3:
+**No hardcoded credentials anywhere.** All five Glue jobs, both crawlers, the state machine, and the EventBridge Pipe use IAM roles. There are no access keys, no secret keys, and no environment variables containing credentials anywhere in the codebase.
 
-1. EventBridge detects the upload and sends a message to SQS. The **SQS queue policy** permits this.
-2. EventBridge Pipes polls SQS using the **pipes-role** (`SqsConsume`), deletes the message, then calls `StartExecution` using the same role (`StartExecution`).
-3. Step Functions assumes the **sfn-role** and begins executing states. It calls `glue:StartCrawler` and `glue:GetCrawler` (`GlueCrawlerControl`), then starts each Glue job using `glue:StartJobRun` and polls with `glue:GetJobRun` (`GlueJobControl`).
-4. Each Glue job runs under the **glue-pipeline-role**, reading from S3 (`AmazonS3FullAccess`), writing to S3, writing to DynamoDB (`AmazonDynamoDBFullAccess`), and streaming logs to CloudWatch (`CloudWatchLogsFullAccess`).
-5. If any step fails, Step Functions calls `sns:Publish` using the **sfn-role** (`SnsPublish`). The **SNS topic policy** permits this call from the Step Functions service principal.
+**Service principal trust policies.** Every trust policy names a single AWS service principal. No human user ARN and no cross-account principal appears in any trust policy. This ensures the roles can only be assumed by AWS services acting within their normal operational scope.
+
+**One role per service boundary.** Three services (Glue, Step Functions, EventBridge Pipes) have three separate roles. No role is shared across service boundaries.
+
+**Inline policies for dynamic resource ARNs.** The Step Functions and EventBridge Pipes inline policies reference specific resource ARNs that only exist after Terraform creates them. Using `aws_iam_policy_document` data sources with Terraform interpolation ensures the deployed policy contains the actual ARN rather than a placeholder.
+
+**Condition keys on resource-based policies.** The SQS queue policy uses `aws:SourceArn` to restrict message delivery to one specific EventBridge rule. This is a defense-in-depth measure against confused deputy attacks, where a legitimate service is tricked into acting on behalf of an unauthorized caller.
+
+**Terraform manages all IAM.** Every role, policy, attachment, and resource-based policy is declared in Terraform. No IAM resource in this project was created manually in the AWS console. This means the full permission model is version-controlled, reviewable in pull requests, and reproducible across environments.
+
+**Separation between data plane and control plane permissions.** The Glue role holds data plane permissions: reading and writing data. The Step Functions role holds control plane permissions: starting and stopping other services. The EventBridge Pipes role holds only queue consumer permissions. No role mixes data plane and control plane authority.

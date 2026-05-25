@@ -49,20 +49,21 @@ def archiveProcessedStreams(s3Client, rawBucket, archiveBucket):
     logger.info(f"Archived {len(keys)} file(s) to s3://{archiveBucket}/{STREAMS_PREFIX}")
 
 
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "raw_bucket", "archive_bucket", "aws_region"])
+if __name__ == "__main__":
+    args = getResolvedOptions(sys.argv, ["JOB_NAME", "raw_bucket", "archive_bucket", "aws_region"])
 
-sc = SparkContext()
-glueContext = GlueContext(sc)
-job = Job(glueContext)
-job.init(args["JOB_NAME"], args)
+    sc = SparkContext()
+    glueContext = GlueContext(sc)
+    job = Job(glueContext)
+    job.init(args["JOB_NAME"], args)
 
-s3Client = boto3.client("s3", region_name=args["aws_region"])
+    s3Client = boto3.client("s3", region_name=args["aws_region"])
 
-try:
-    archiveProcessedStreams(s3Client, args["raw_bucket"], args["archive_bucket"])
-except Exception as error:
-    logger.error(f"Archive job failed: {error}")
-    raise
+    try:
+        archiveProcessedStreams(s3Client, args["raw_bucket"], args["archive_bucket"])
+    except Exception as error:
+        logger.error(f"Archive job failed: {error}")
+        raise
 
-logger.info("Archive job complete.")
-job.commit()
+    logger.info("Archive job complete.")
+    job.commit()

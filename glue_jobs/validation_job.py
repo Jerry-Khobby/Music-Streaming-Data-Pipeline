@@ -50,17 +50,18 @@ def validateAllTables(glueContext, database):
     logger.info("All datasets passed validation successfully.")
 
 
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "glue_database"])
+if __name__ == "__main__":
+    args = getResolvedOptions(sys.argv, ["JOB_NAME", "glue_database"])
 
-sc = SparkContext()
-glueContext = GlueContext(sc)
-job = Job(glueContext)
-job.init(args["JOB_NAME"], args)
+    sc = SparkContext()
+    glueContext = GlueContext(sc)
+    job = Job(glueContext)
+    job.init(args["JOB_NAME"], args)
 
-try:
-    validateAllTables(glueContext, args["glue_database"])
-except ValueError as error:
-    logger.error(f"Validation failed — aborting pipeline: {error}")
-    raise
+    try:
+        validateAllTables(glueContext, args["glue_database"])
+    except ValueError as error:
+        logger.error(f"Validation failed — aborting pipeline: {error}")
+        raise
 
-job.commit()
+    job.commit()

@@ -14,7 +14,7 @@ Covers:
 
 import sys
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, PropertyMock
 from pyspark.sql import functions as F
 
 with patch("pyspark.context.SparkContext"):
@@ -324,35 +324,28 @@ class TestComputeTopGenresPerDay:
 # ---------------------------------------------------------------------------
 
 class TestWriteParquet:
-    def test_writes_with_overwrite_mode(self, enriched_df):
+    def _mock_writer(self):
         mock_writer = MagicMock()
         mock_writer.mode.return_value = mock_writer
         mock_writer.format.return_value = mock_writer
         mock_writer.partitionBy.return_value = mock_writer
+        mock_writer.save.return_value = None
+        return mock_writer
 
-        with patch.object(enriched_df, "write", mock_writer):
+    def test_writes_with_overwrite_mode(self, enriched_df):
+        mock_writer = self._mock_writer()
+        with patch("pyspark.sql.DataFrame.write", new_callable=PropertyMock, return_value=mock_writer):
             writeParquet(enriched_df, "s3://bucket/path", partitionCols=["stream_date"])
-
         mock_writer.mode.assert_called_once_with("overwrite")
 
     def test_writes_parquet_format(self, enriched_df):
-        mock_writer = MagicMock()
-        mock_writer.mode.return_value = mock_writer
-        mock_writer.format.return_value = mock_writer
-        mock_writer.partitionBy.return_value = mock_writer
-
-        with patch.object(enriched_df, "write", mock_writer):
+        mock_writer = self._mock_writer()
+        with patch("pyspark.sql.DataFrame.write", new_callable=PropertyMock, return_value=mock_writer):
             writeParquet(enriched_df, "s3://bucket/path", partitionCols=["stream_date"])
-
         mock_writer.format.assert_called_once_with("parquet")
 
     def test_no_partition_by_when_cols_omitted(self, enriched_df):
-        mock_writer = MagicMock()
-        mock_writer.mode.return_value = mock_writer
-        mock_writer.format.return_value = mock_writer
-        mock_writer.save.return_value = None
-
-        with patch.object(enriched_df, "write", mock_writer):
+        mock_writer = self._mock_writer()
+        with patch("pyspark.sql.DataFrame.write", new_callable=PropertyMock, return_value=mock_writer):
             writeParquet(enriched_df, "s3://bucket/path")
-
         mock_writer.partitionBy.assert_not_called()
