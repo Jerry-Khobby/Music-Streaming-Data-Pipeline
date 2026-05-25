@@ -1,68 +1,89 @@
 import sys
 import logging
 from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
-from awsglue.context import GlueContext
 from awsglue.job import Job
+from awsglue.context import GlueContext
+from pyspark.context import SparkContext
 import boto3
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-STREAMS_PREFIX = "streams/"
+STREAMS_PREFIX  = "streams/"
+S3_DELETE_LIMIT = 1000
 
 
-def listStreamObjects(s3Client, bucket):
-    paginator = s3Client.get_paginator("list_objects_v2")
-    pages = paginator.paginate(Bucket=bucket, Prefix=STREAMS_PREFIX)
+def list_stream_objects(s3_client, bucket):
+    paginator = s3_client.get_paginator("list_objects_v2")
+    pages     = paginator.paginate(Bucket=bucket, Prefix=STREAMS_PREFIX)
     return [
         obj["Key"]
         for page in pages
         for obj in page.get("Contents", [])
-        if not obj["Key"].endswith("/")   # skip folder placeholders
+        if not obj["Key"].endswith("/")
     ]
 
 
-def copyObject(s3Client, sourceBucket, archiveBucket, key):
-    copySource = {"Bucket": sourceBucket, "Key": key}
-    s3Client.copy_object(CopySource=copySource, Bucket=archiveBucket, Key=key)
-    logger.info(f"Copied s3://{sourceBucket}/{key}  →  s3://{archiveBucket}/{key}")
+def copy_objects(s3_client, source_bucket, archive_bucket, keys):
+    for key in keys:
+        s3_client.copy_object(
+            CopySource={"Bucket": source_bucket, "Key": key},
+            Bucket=archive_bucket,
+            Key=key,
+        )
+    logger.info(f"Copied {len(keys)} file(s) to s3://{archive_bucket}/{STREAMS_PREFIX}")
 
 
-def deleteObject(s3Client, bucket, key):
-    s3Client.delete_object(Bucket=bucket, Key=key)
-    logger.info(f"Deleted s3://{bucket}/{key}")
+def bulk_delete_objects(s3_client, bucket, keys):
+    # S3 delete_objects accepts up to 1000 keys per call
+    for i in range(0, len(keys), S3_DELETE_LIMIT):
+        batch = [{"Key": k} for k in keys[i : i + S3_DELETE_LIMIT]]
+        response = s3_client.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": batch, "Quiet": False},
+        )
+        errors = response.get("Errors", [])
+        if errors:
+            failed_keys = [e["Key"] for e in errors]
+            raise RuntimeError(
+                f"S3 bulk delete partially failed for {len(failed_keys)} key(s): {failed_keys}. "
+                "These files remain in the raw bucket and will be reprocessed next run. "
+                "Deduplication in the ETL job will prevent duplicate KPIs."
+            )
+    logger.info(f"Deleted {len(keys)} file(s) from s3://{bucket}/{STREAMS_PREFIX}")
 
 
-def archiveObject(s3Client, rawBucket, archiveBucket, key):
-    copyObject(s3Client, rawBucket, archiveBucket, key)
-    deleteObject(s3Client, rawBucket, key)
-
-
-def archiveProcessedStreams(s3Client, rawBucket, archiveBucket):
-    keys = listStreamObjects(s3Client, rawBucket)
+def archive_processed_streams(s3_client, raw_bucket, archive_bucket):
+    keys = list_stream_objects(s3_client, raw_bucket)
     if not keys:
         logger.info("No stream files found to archive.")
         return
-    for key in keys:
-        archiveObject(s3Client, rawBucket, archiveBucket, key)
-    logger.info(f"Archived {len(keys)} file(s) to s3://{archiveBucket}/{STREAMS_PREFIX}")
+
+    # Copy all files first; only delete after all copies succeed.
+    # If copy fails the raw files remain intact and the next run reprocesses them safely.
+    # If delete fails after copy, files exist in both locations — deduplication handles correctness.
+    copy_objects(s3_client, raw_bucket, archive_bucket, keys)
+    bulk_delete_objects(s3_client, raw_bucket, keys)
+
+    logger.info(f"Archived {len(keys)} file(s) to s3://{archive_bucket}/{STREAMS_PREFIX}")
 
 
 if __name__ == "__main__":
-    args = getResolvedOptions(sys.argv, ["JOB_NAME", "raw_bucket", "archive_bucket", "aws_region"])
+    args = getResolvedOptions(
+        sys.argv, ["JOB_NAME", "raw_bucket", "archive_bucket", "aws_region"]
+    )
 
-    sc = SparkContext()
-    glueContext = GlueContext(sc)
-    job = Job(glueContext)
+    sc          = SparkContext()
+    glue_ctx    = GlueContext(sc)
+    job         = Job(glue_ctx)
     job.init(args["JOB_NAME"], args)
 
-    s3Client = boto3.client("s3", region_name=args["aws_region"])
+    s3_client = boto3.client("s3", region_name=args["aws_region"])
 
     try:
-        archiveProcessedStreams(s3Client, args["raw_bucket"], args["archive_bucket"])
+        archive_processed_streams(s3_client, args["raw_bucket"], args["archive_bucket"])
     except Exception as error:
-        logger.error(f"Archive job failed: {error}")
+        logger.exception(f"Archive job failed: {error}")
         raise
 
     logger.info("Archive job complete.")

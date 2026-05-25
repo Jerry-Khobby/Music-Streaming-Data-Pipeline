@@ -44,18 +44,27 @@ resource "aws_s3_object" "songs_folder" {
   bucket  = aws_s3_bucket.raw.id
   key     = "songs/"
   content = ""
+
+
+  depends_on = [aws_pipes_pipe.sqs_to_sfn]  
 }
 
 resource "aws_s3_object" "streams_folder" {
   bucket  = aws_s3_bucket.raw.id
   key     = "streams/"
   content = ""
+
+
+  depends_on = [aws_pipes_pipe.sqs_to_sfn]  
 }
 
 resource "aws_s3_object" "users_folder" {
   bucket  = aws_s3_bucket.raw.id
   key     = "users/"
   content = ""
+
+
+  depends_on = [aws_pipes_pipe.sqs_to_sfn]  
 }
 
 
@@ -376,6 +385,8 @@ resource "aws_s3_object" "streams1_data" {
   tags = {
     Layer = "bronze"
   }
+
+  depends_on = [aws_s3_object.streams_folder]
 }
 
 resource "aws_s3_object" "streams2_data" {
@@ -387,6 +398,8 @@ resource "aws_s3_object" "streams2_data" {
   tags = {
     Layer = "bronze"
   }
+
+  depends_on = [aws_s3_object.streams1_data]
 }
 
 resource "aws_s3_object" "streams3_data" {
@@ -398,6 +411,8 @@ resource "aws_s3_object" "streams3_data" {
   tags = {
     Layer = "bronze"
   }
+
+  depends_on = [aws_s3_object.streams2_data]
 }
 
 resource "aws_s3_object" "users_data" {

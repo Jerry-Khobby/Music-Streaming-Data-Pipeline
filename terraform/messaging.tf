@@ -8,6 +8,8 @@
 #          → EventBridge Pipe
 #            → Step Functions StartExecution
 
+data "aws_caller_identity" "current" {}
+
 
 # ── SNS TOPIC — failure alerts ────────────────────────────────────────────────
 
@@ -97,8 +99,9 @@ resource "aws_sqs_queue_policy" "pipeline_events" {
 # ── EVENTBRIDGE RULE — S3 ObjectCreated on streams/ ──────────────────────────
 
 resource "aws_cloudwatch_event_rule" "streams_uploaded" {
-  name        = "${var.project_name}-streams-uploaded"
-  description = "Fires when a new file is uploaded to the raw bucket under streams/"
+  name           = "${var.project_name}-streams-uploaded"
+  description    = "Fires when a new file is uploaded to the raw bucket under streams/"
+  event_bus_name = "default"
 
   event_pattern = jsonencode({
     source      = ["aws.s3"]
@@ -119,9 +122,19 @@ resource "aws_cloudwatch_event_rule" "streams_uploaded" {
 }
 
 resource "aws_cloudwatch_event_target" "sqs_target" {
-  rule      = aws_cloudwatch_event_rule.streams_uploaded.name
-  target_id = "SendToSQS"
-  arn       = aws_sqs_queue.pipeline_events.arn
+  rule           = aws_cloudwatch_event_rule.streams_uploaded.name
+  event_bus_name = "default"
+  target_id      = "SendToSQS"
+  arn            = aws_sqs_queue.pipeline_events.arn
+
+  dead_letter_config {
+    arn = aws_sqs_queue.pipeline_dlq.arn
+  }
+
+  retry_policy {
+    maximum_event_age_in_seconds = 3600
+    maximum_retry_attempts       = 3
+  }
 }
 
 
@@ -134,6 +147,11 @@ data "aws_iam_policy_document" "pipes_trust" {
     principals {
       type        = "Service"
       identifiers = ["pipes.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
     }
   }
 }
@@ -174,9 +192,10 @@ resource "aws_iam_role_policy" "pipes_permissions" {
 # ── EVENTBRIDGE PIPE — SQS → Step Functions ───────────────────────────────────
 
 resource "aws_pipes_pipe" "sqs_to_sfn" {
-  name        = "${var.project_name}-sqs-to-sfn"
-  description = "Polls SQS for S3 events and starts the Step Functions pipeline execution"
-  role_arn    = aws_iam_role.pipes_role.arn
+  name          = "${var.project_name}-sqs-to-sfn"
+  description   = "Polls SQS for S3 events and starts the Step Functions pipeline execution"
+  role_arn      = aws_iam_role.pipes_role.arn
+  desired_state = "RUNNING"
 
   source = aws_sqs_queue.pipeline_events.arn
   source_parameters {
@@ -191,6 +210,7 @@ resource "aws_pipes_pipe" "sqs_to_sfn" {
     step_function_state_machine_parameters {
       invocation_type = "FIRE_AND_FORGET"
     }
+    input_template = "{}"
   }
 
   tags = {
@@ -200,5 +220,8 @@ resource "aws_pipes_pipe" "sqs_to_sfn" {
   depends_on = [
     aws_iam_role_policy.pipes_permissions,
     aws_sfn_state_machine.pipeline,
+    aws_sqs_queue_policy.pipeline_events,
+    aws_cloudwatch_event_rule.streams_uploaded,
+    aws_cloudwatch_event_target.sqs_target,
   ]
 }
