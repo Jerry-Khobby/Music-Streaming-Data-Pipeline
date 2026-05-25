@@ -1,0 +1,27 @@
+# Terraform — provider binary alone is 719 MB
+terraform/
+
+# Raw data files — not needed inside the test container
+data/
+
+# Documentation and diagrams
+docs/
+
+# Step Functions JSON — not imported by any test
+step_functions/
+
+# Git history
+.git/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+coverage-report/
+.coverage
+
+# Environment files
+.env
+*.tfstate
+*.tfstate.backup

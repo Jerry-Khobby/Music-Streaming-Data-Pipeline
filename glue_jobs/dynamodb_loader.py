@@ -77,24 +77,25 @@ def loadToDynamo(df, tableName, region, itemBuilder):
     logger.info(f"Loaded data into DynamoDB table: {tableName}")
 
 
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "curated_bucket", "aws_region"])
+if __name__ == "__main__":
+    args = getResolvedOptions(sys.argv, ["JOB_NAME", "curated_bucket", "aws_region"])
 
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args["JOB_NAME"], args)
+    sc = SparkContext()
+    glueContext = GlueContext(sc)
+    spark = glueContext.spark_session
+    job = Job(glueContext)
+    job.init(args["JOB_NAME"], args)
 
-goldBase = f"s3://{args['curated_bucket']}/gold"
-region   = args["aws_region"]
+    goldBase = f"s3://{args['curated_bucket']}/gold"
+    region   = args["aws_region"]
 
-genreKpisDF = loadParquet(spark, f"{goldBase}/genre_kpis").dropDuplicates(["genre_date"])
-topSongsDF  = loadParquet(spark, f"{goldBase}/top_songs").dropDuplicates(["genre_date", "rank"])
-topGenresDF = loadParquet(spark, f"{goldBase}/top_genres").dropDuplicates(["date", "rank"])
+    genreKpisDF = loadParquet(spark, f"{goldBase}/genre_kpis").dropDuplicates(["genre_date"])
+    topSongsDF  = loadParquet(spark, f"{goldBase}/top_songs").dropDuplicates(["genre_date", "rank"])
+    topGenresDF = loadParquet(spark, f"{goldBase}/top_genres").dropDuplicates(["date", "rank"])
 
-loadToDynamo(genreKpisDF, GENRE_KPIS_TABLE, region, buildGenreKpisItem)
-loadToDynamo(topSongsDF,  TOP_SONGS_TABLE,  region, buildTopSongsItem)
-loadToDynamo(topGenresDF, TOP_GENRES_TABLE, region, buildTopGenresItem)
+    loadToDynamo(genreKpisDF, GENRE_KPIS_TABLE, region, buildGenreKpisItem)
+    loadToDynamo(topSongsDF,  TOP_SONGS_TABLE,  region, buildTopSongsItem)
+    loadToDynamo(topGenresDF, TOP_GENRES_TABLE, region, buildTopGenresItem)
 
-logger.info("DynamoDB load complete.")
-job.commit()
+    logger.info("DynamoDB load complete.")
+    job.commit()

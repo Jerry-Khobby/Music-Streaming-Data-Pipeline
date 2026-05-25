@@ -99,28 +99,29 @@ def writeParquet(df, path, partitionCols=None):
     logger.info(f"Written to {path}")
 
 
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "curated_bucket"])
+if __name__ == "__main__":
+    args = getResolvedOptions(sys.argv, ["JOB_NAME", "curated_bucket"])
 
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args["JOB_NAME"], args)
+    sc = SparkContext()
+    glueContext = GlueContext(sc)
+    spark = glueContext.spark_session
+    job = Job(glueContext)
+    job.init(args["JOB_NAME"], args)
 
-silverBase = f"s3://{args['curated_bucket']}/silver"
-goldBase   = f"s3://{args['curated_bucket']}/gold"
+    silverBase = f"s3://{args['curated_bucket']}/silver"
+    goldBase   = f"s3://{args['curated_bucket']}/gold"
 
-enrichedDF = loadParquet(spark, f"{silverBase}/enriched_streams")
-enrichedDF.cache()
+    enrichedDF = loadParquet(spark, f"{silverBase}/enriched_streams")
+    enrichedDF.cache()
 
-genreKpisDF = assembleGenreKpis(enrichedDF)
-topSongsDF  = computeTopSongsPerGenre(enrichedDF)
-topGenresDF = computeTopGenresPerDay(genreKpisDF)
+    genreKpisDF = assembleGenreKpis(enrichedDF)
+    topSongsDF  = computeTopSongsPerGenre(enrichedDF)
+    topGenresDF = computeTopGenresPerDay(genreKpisDF)
 
-writeParquet(genreKpisDF, f"{goldBase}/genre_kpis", partitionCols=["stream_date"])
-writeParquet(topSongsDF,  f"{goldBase}/top_songs",  partitionCols=["stream_date"])
-writeParquet(topGenresDF, f"{goldBase}/top_genres",  partitionCols=["date"])
+    writeParquet(genreKpisDF, f"{goldBase}/genre_kpis", partitionCols=["stream_date"])
+    writeParquet(topSongsDF,  f"{goldBase}/top_songs",  partitionCols=["stream_date"])
+    writeParquet(topGenresDF, f"{goldBase}/top_genres",  partitionCols=["date"])
 
-enrichedDF.unpersist()
-logger.info("KPI aggregation complete.")
-job.commit()
+    enrichedDF.unpersist()
+    logger.info("KPI aggregation complete.")
+    job.commit()

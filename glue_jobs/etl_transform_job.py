@@ -37,25 +37,26 @@ def writeParquet(df, path, partitionCols=None):
     logger.info(f"Written {df.count()} rows to {path}")
 
 
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "glue_database", "curated_bucket"])
+if __name__ == "__main__":
+    args = getResolvedOptions(sys.argv, ["JOB_NAME", "glue_database", "curated_bucket"])
 
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args["JOB_NAME"], args)
+    sc = SparkContext()
+    glueContext = GlueContext(sc)
+    spark = glueContext.spark_session
+    job = Job(glueContext)
+    job.init(args["JOB_NAME"], args)
 
-silverBase = f"s3://{args['curated_bucket']}/silver"
-database   = args["glue_database"]
+    silverBase = f"s3://{args['curated_bucket']}/silver"
+    database   = args["glue_database"]
 
-streamsDF  = loadTable(glueContext, database, "streams")
-songsDF    = loadTable(glueContext, database, "songs")
-enrichedDF = buildEnrichedStreams(streamsDF, songsDF)
+    streamsDF  = loadTable(glueContext, database, "streams")
+    songsDF    = loadTable(glueContext, database, "songs")
+    enrichedDF = buildEnrichedStreams(streamsDF, songsDF)
 
-writeParquet(enrichedDF, f"{silverBase}/enriched_streams", partitionCols=["stream_date"])
+    writeParquet(enrichedDF, f"{silverBase}/enriched_streams", partitionCols=["stream_date"])
 
-logger.info("Bronze → Silver complete. Enriched streams written to silver layer.")
-job.commit()
+    logger.info("Bronze → Silver complete. Enriched streams written to silver layer.")
+    job.commit()
 
 
 
