@@ -58,6 +58,16 @@ data "aws_iam_policy_document" "sfn_permissions" {
   }
 
   statement {
+    sid    = "ListExecutionsForSingletonGuard"
+    effect = "Allow"
+    actions = [
+      "states:ListExecutions",
+      "states:DescribeExecution",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
     sid       = "SnsPublish"
     effect    = "Allow"
     actions   = ["sns:Publish"]
@@ -114,7 +124,44 @@ locals {
       NormalizeInput = {
         Type      = "Pass"
         InputPath = "$[0]"
-        Next      = "StartRawCrawler"
+        Next      = "CheckRunningExecutions"
+      }
+
+      # Singleton guard — when 3 stream files upload in quick succession the Pipe
+      # spawns 3 executions. The first does the work; the others see a running
+      # peer and exit immediately, preventing Glue concurrent-run failures.
+      CheckRunningExecutions = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::aws-sdk:sfn:listExecutions"
+        Parameters = {
+          StateMachineArn = "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:stateMachine:${var.project_name}-pipeline"
+          StatusFilter    = "RUNNING"
+          MaxResults      = 10
+        }
+        ResultPath = "$.peers"
+        Next       = "IsAnotherExecutionRunning"
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = "$.error"
+          Next        = "NotifyFailure"
+        }]
+      }
+
+      # If more than one execution is in RUNNING state (this one + at least one peer),
+      # exit gracefully so the active execution can complete.
+      IsAnotherExecutionRunning = {
+        Type = "Choice"
+        Choices = [{
+          Variable      = "$.peers.Executions[1].ExecutionArn"
+          IsPresent     = true
+          Next          = "PipelineSkipped"
+        }]
+        Default = "StartRawCrawler"
+      }
+
+      PipelineSkipped = {
+        Type   = "Succeed"
+        Comment = "Another execution is already running for this batch of files — skipping to avoid Glue concurrent-run conflicts."
       }
 
       StartRawCrawler = {
@@ -225,12 +272,37 @@ locals {
           JobName = aws_glue_job.dynamodb_loader.name
         }
         ResultPath = "$.dynamoResult"
-        Next       = "ArchiveFiles"
+        Next       = "StartCuratedCrawler"
         Catch = [{
           ErrorEquals = ["States.ALL"]
           ResultPath  = "$.error"
           Next        = "NotifyFailure"
         }]
+      }
+
+      # Refresh Athena partitions for gold/ so analysts can query the new KPIs
+      # immediately. Failure here is non-fatal — Athena queries will just miss
+      # the latest partition until the next run.
+      StartCuratedCrawler = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::aws-sdk:glue:startCrawler"
+        Parameters = {
+          Name = aws_glue_crawler.curated_crawler.name
+        }
+        ResultPath = null
+        Next       = "ArchiveFiles"
+        Catch = [
+          {
+            ErrorEquals = ["Glue.CrawlerRunningException"]
+            ResultPath  = null
+            Next        = "ArchiveFiles"
+          },
+          {
+            ErrorEquals = ["States.ALL"]
+            ResultPath  = null
+            Next        = "ArchiveFiles"
+          }
+        ]
       }
 
       ArchiveFiles = {
