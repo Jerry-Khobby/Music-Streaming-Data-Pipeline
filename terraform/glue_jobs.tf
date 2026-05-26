@@ -184,35 +184,33 @@ resource "aws_glue_job" "archive" {
   description = "Copies processed raw stream files to the archive bucket and deletes originals"
 
   command {
-    name            = "pythonshell"
+    name            = "glueetl"
     script_location = "s3://${aws_s3_bucket.curated.id}/scripts/archive_job.py"
-    python_version  = "3.9"
+    python_version  = "3"
   }
 
-  glue_version      = "3.0"
-  max_capacity      = 0.0625 # Python Shell DPU — smallest available, fits S3 list/copy/delete
+  glue_version      = "4.0"
+  worker_type       = "G.1X"
+  number_of_workers = 2
   timeout           = 10
 
   execution_property {
     max_concurrent_runs = 1
   }
 
-  default_arguments = {
-    "--job-language"   = "python"
+  default_arguments = merge(local.glue_common_args, {
     "--raw_bucket"     = aws_s3_bucket.raw.id
     "--archive_bucket" = aws_s3_bucket.archive.id
     "--aws_region"     = var.aws_region
-  }
+  })
 
   tags = {
     Pipeline = "music-streaming"
     Step     = "4-archive"
-    JobType  = "pythonshell"
   }
 
   depends_on = [aws_s3_object.script_archive]
 }
-
 
 # ── GLUE JOB 5 — kpi_aggregation_job (standalone) ────────────────────────────
 
