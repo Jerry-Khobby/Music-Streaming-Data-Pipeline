@@ -29,15 +29,26 @@ resource "aws_sns_topic_policy" "pipeline_alerts" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid    = "AllowStepFunctionsPublish"
-      Effect = "Allow"
-      Principal = {
-        Service = "states.amazonaws.com"
+    Statement = [
+      {
+        Sid    = "AllowStepFunctionsPublish"
+        Effect = "Allow"
+        Principal = {
+          Service = "states.amazonaws.com"
+        }
+        Action   = "sns:Publish"
+        Resource = aws_sns_topic.pipeline_alerts.arn
+      },
+      {
+        Sid    = "AllowCloudWatchAlarmsPublish"
+        Effect = "Allow"
+        Principal = {
+          Service = "cloudwatch.amazonaws.com"
+        }
+        Action   = "sns:Publish"
+        Resource = aws_sns_topic.pipeline_alerts.arn
       }
-      Action   = "sns:Publish"
-      Resource = aws_sns_topic.pipeline_alerts.arn
-    }]
+    ]
   })
 }
 

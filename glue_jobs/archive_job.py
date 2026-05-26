@@ -1,9 +1,6 @@
 import sys
 import logging
 from awsglue.utils import getResolvedOptions
-from awsglue.job import Job
-from awsglue.context import GlueContext
-from pyspark.context import SparkContext
 import boto3
 
 logging.basicConfig(level=logging.INFO)
@@ -73,11 +70,6 @@ if __name__ == "__main__":
         sys.argv, ["JOB_NAME", "raw_bucket", "archive_bucket", "aws_region"]
     )
 
-    sc          = SparkContext()
-    glue_ctx    = GlueContext(sc)
-    job         = Job(glue_ctx)
-    job.init(args["JOB_NAME"], args)
-
     s3_client = boto3.client("s3", region_name=args["aws_region"])
 
     try:
@@ -87,4 +79,3 @@ if __name__ == "__main__":
         raise
 
     logger.info("Archive job complete.")
-    job.commit()

@@ -174,7 +174,9 @@ resource "aws_glue_job" "dynamodb_loader" {
 }
 
 
-# ── GLUE JOB 4 — archive_job ─────────────────────────────────────────────────
+# ── GLUE JOB 4 — archive_job (Python Shell) ──────────────────────────────────
+# Pure boto3 S3 operations — no Spark needed. Python Shell starts in seconds
+# vs. minutes for a Spark cluster, and costs ~4x less per run.
 
 resource "aws_glue_job" "archive" {
   name        = "${var.project_name}-archive"
@@ -182,29 +184,30 @@ resource "aws_glue_job" "archive" {
   description = "Copies processed raw stream files to the archive bucket and deletes originals"
 
   command {
-    name            = "glueetl"
+    name            = "pythonshell"
     script_location = "s3://${aws_s3_bucket.curated.id}/scripts/archive_job.py"
-    python_version  = "3"
+    python_version  = "3.9"
   }
 
-  glue_version      = "4.0"
-  worker_type       = "G.1X"
-  number_of_workers = 2
+  glue_version      = "3.0"
+  max_capacity      = 0.0625 # Python Shell DPU — smallest available, fits S3 list/copy/delete
   timeout           = 10
 
   execution_property {
     max_concurrent_runs = 1
   }
 
-  default_arguments = merge(local.glue_common_args, {
+  default_arguments = {
+    "--job-language"   = "python"
     "--raw_bucket"     = aws_s3_bucket.raw.id
     "--archive_bucket" = aws_s3_bucket.archive.id
     "--aws_region"     = var.aws_region
-  })
+  }
 
   tags = {
     Pipeline = "music-streaming"
     Step     = "4-archive"
+    JobType  = "pythonshell"
   }
 
   depends_on = [aws_s3_object.script_archive]

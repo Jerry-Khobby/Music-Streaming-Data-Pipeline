@@ -57,3 +57,20 @@ variable "glue_role_name" {
   type        = string
   default     = "glue-pipeline-role"
 }
+
+# ── Monitoring / Slack alerts ───────────────────────────────────────────────
+# Both values come from AWS Chatbot AFTER you authorise the Slack workspace
+# once in the console (AWS Console → AWS Chatbot → Configure new client → Slack).
+# Leave both empty to deploy alarms only — the Chatbot resource is skipped.
+
+variable "slack_workspace_id" {
+  description = "Slack workspace ID from AWS Chatbot console (e.g. T01234ABCDE). Empty disables Slack."
+  type        = string
+  default     = ""
+}
+
+variable "slack_channel_id" {
+  description = "Slack channel ID (right-click channel in Slack → Copy link, ID is the last segment, e.g. C01234ABCDE)"
+  type        = string
+  default     = ""
+}
