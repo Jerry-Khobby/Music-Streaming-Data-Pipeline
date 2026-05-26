@@ -33,9 +33,6 @@ resource "aws_cloudwatch_metric_alarm" "sfn_execution_failed" {
   dimensions = {
     StateMachineArn = aws_sfn_state_machine.pipeline.arn
   }
-
-  alarm_actions = [aws_sns_topic.pipeline_alerts.arn]
-  ok_actions    = [aws_sns_topic.pipeline_alerts.arn]
 }
 
 # 2. Step Functions execution timed out
@@ -55,8 +52,6 @@ resource "aws_cloudwatch_metric_alarm" "sfn_execution_timed_out" {
   dimensions = {
     StateMachineArn = aws_sfn_state_machine.pipeline.arn
   }
-
-  alarm_actions = [aws_sns_topic.pipeline_alerts.arn]
 }
 
 # 3. Dead-letter queue has messages — poison events that EventBridge gave up on
@@ -76,8 +71,6 @@ resource "aws_cloudwatch_metric_alarm" "sqs_dlq_has_messages" {
   dimensions = {
     QueueName = aws_sqs_queue.pipeline_dlq.name
   }
-
-  alarm_actions = [aws_sns_topic.pipeline_alerts.arn]
 }
 
 # 4. Main queue backed up — messages older than 15 minutes mean the Pipe isn't draining
@@ -97,8 +90,6 @@ resource "aws_cloudwatch_metric_alarm" "sqs_messages_stuck" {
   dimensions = {
     QueueName = aws_sqs_queue.pipeline_events.name
   }
-
-  alarm_actions = [aws_sns_topic.pipeline_alerts.arn]
 }
 
 # 5. Per-Glue-job failure alarms — useful for pinpointing WHICH job broke
@@ -132,8 +123,72 @@ resource "aws_cloudwatch_metric_alarm" "glue_job_failed" {
     JobRunId = "ALL"
     Type     = "gauge"
   }
+}
 
-  alarm_actions = [aws_sns_topic.pipeline_alerts.arn]
+
+# ── HUMAN-READABLE EMAIL ALERTS ──────────────────────────────────────────────
+# CloudWatch's default email is a structured blob that mixes ARNs, metric math
+# and the actual signal. We catch the same state-change event via EventBridge
+# and rewrite it with an input transformer so subscribers see plain language:
+# what fired, why, when, and where to look.
+#
+# The alarms above intentionally have NO alarm_actions — both the email and
+# Slack paths converge through this single transformer, so the message format
+# stays consistent everywhere and nobody gets duplicate alerts.
+
+resource "aws_cloudwatch_event_rule" "alarm_state_change" {
+  name        = "${var.project_name}-alarm-state-change"
+  description = "Catches ALARM transitions for this pipeline's CloudWatch alarms and reshapes them before SNS forwards them"
+
+  event_pattern = jsonencode({
+    source       = ["aws.cloudwatch"]
+    "detail-type" = ["CloudWatch Alarm State Change"]
+    detail = {
+      state = {
+        value = ["ALARM"]
+      }
+      # Limits the rule to this project's alarms only.
+      alarmName = [{ prefix = "${var.project_name}-" }]
+    }
+  })
+
+  tags = {
+    Purpose = "Source of human-readable email alerts"
+  }
+}
+
+resource "aws_cloudwatch_event_target" "alarm_to_sns" {
+  rule      = aws_cloudwatch_event_rule.alarm_state_change.name
+  target_id = "FormattedSnsAlert"
+  arn       = aws_sns_topic.pipeline_alerts.arn
+
+  # Each quoted line below becomes one line in the email body.
+  # <placeholders> are substituted from input_paths.
+  input_transformer {
+    input_paths = {
+      alarm       = "$.detail.alarmName"
+      description = "$.detail.configuration.description"
+      reason      = "$.detail.state.reason"
+      time        = "$.time"
+      region      = "$.region"
+    }
+
+    input_template = <<EOT
+"Pipeline alert: <alarm>"
+""
+"What this alarm watches:"
+"  <description>"
+""
+"Why it fired now:"
+"  <reason>"
+""
+"When: <time>"
+"Region: <region>"
+""
+"Open the alarm in the console:"
+"  https://<region>.console.aws.amazon.com/cloudwatch/home?region=<region>#alarmsV2:alarm/<alarm>"
+EOT
+  }
 }
 
 
@@ -217,4 +272,9 @@ output "monitoring_alarms" {
 output "slack_alerts_status" {
   description = "Whether Slack alerts are wired up"
   value       = local.slack_enabled ? "Enabled — posting to channel ${var.slack_channel_id}" : "Disabled — set slack_workspace_id and slack_channel_id to enable"
+}
+
+output "email_alerts_status" {
+  description = "Whether email alerts are wired up — recipient must click the confirmation link in their inbox before alerts start flowing"
+  value       = var.alert_email == "" ? "Disabled — set alert_email to enable" : "Subscribed ${var.alert_email} (confirm via the link sent to that inbox)"
 }

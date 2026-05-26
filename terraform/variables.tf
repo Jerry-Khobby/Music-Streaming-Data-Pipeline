@@ -74,3 +74,24 @@ variable "slack_channel_id" {
   type        = string
   default     = ""
 }
+
+# Address subscribed to the pipeline_alerts SNS topic. AWS sends a confirmation
+# link on first apply — the subscription stays "PendingConfirmation" until the
+# recipient clicks it, so no alerts are delivered until then.
+variable "alert_email" {
+  description = "Email address that receives pipeline failure alerts. Empty disables email subscription."
+  type        = string
+  default     = "jeremiah.coblah@amalitechtraining.org"
+
+  validation {
+    condition     = var.alert_email == "" || can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", var.alert_email))
+    error_message = "alert_email must be a valid email address or empty."
+  }
+}
+
+
+variable "aws_account_id" {
+  description = "AWS account ID — used to build ARNs inside the state machine definition"
+  type        = string
+  default     = ""
+}

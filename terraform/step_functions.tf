@@ -122,11 +122,10 @@ locals {
       # EventBridge Pipes delivers the SQS record as an array [{}].
       # $[0] unwraps it into a plain object so all ResultPath writes succeed.
       NormalizeInput = {
-        Type      = "Pass"
-        InputPath = "$[0]"
-        Next      = "CheckRunningExecutions"
+        Type       = "Pass"
+        Parameters = {}
+        Next       = "CheckRunningExecutions"
       }
-
       # Singleton guard — when 3 stream files upload in quick succession the Pipe
       # spawns 3 executions. The first does the work; the others see a running
       # peer and exit immediately, preventing Glue concurrent-run failures.
@@ -152,16 +151,15 @@ locals {
       IsAnotherExecutionRunning = {
         Type = "Choice"
         Choices = [{
-          Variable      = "$.peers.Executions[1].ExecutionArn"
-          IsPresent     = true
-          Next          = "PipelineSkipped"
+          Variable  = "$.peers.Executions[1].ExecutionArn"
+          IsPresent = true
+          Next      = "PipelineSkipped"
         }]
         Default = "StartRawCrawler"
       }
 
       PipelineSkipped = {
-        Type   = "Succeed"
-        Comment = "Another execution is already running for this batch of files — skipping to avoid Glue concurrent-run conflicts."
+        Type = "Succeed"
       }
 
       StartRawCrawler = {
@@ -325,8 +323,8 @@ locals {
         Resource = "arn:aws:states:::sns:publish"
         Parameters = {
           TopicArn    = aws_sns_topic.pipeline_alerts.arn
-          Subject     = "Music Streaming Pipeline FAILED"
-          "Message.$" = "States.Format('Pipeline failed. Error details: {}', States.JsonToString($.error))"
+          Subject     = "❌ Music Streaming Pipeline FAILED"
+          "Message.$" = "States.Format('PIPELINE FAILED\n\nError: {}\nCause: {}\n\nStep Functions console (click the red execution):\nhttps://us-east-1.console.aws.amazon.com/states/home?region=us-east-1#/statemachines\n\nGlue job run history (if a Glue job failed):\nhttps://us-east-1.console.aws.amazon.com/glue/home?region=us-east-1#/etl/jobs', $.error.Error, $.error.Cause)"
         }
         ResultPath = "$.snsResult"
         Next       = "PipelineFailed"

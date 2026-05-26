@@ -128,7 +128,7 @@ output "state_machine_name" {
 # ── MESSAGING ─────────────────────────────────────────────────
 
 output "sns_alerts_topic_arn" {
-  description = "SNS topic ARN — subscribe an email: aws sns subscribe --topic-arn <arn> --protocol email --notification-endpoint you@example.com"
+  description = "SNS topic ARN — email subscription is managed via the alert_email variable; see email_alerts_status for current state"
   value       = aws_sns_topic.pipeline_alerts.arn
 }
 

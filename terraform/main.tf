@@ -49,14 +49,6 @@ resource "aws_s3_object" "songs_folder" {
   depends_on = [aws_pipes_pipe.sqs_to_sfn]  
 }
 
-resource "aws_s3_object" "streams_folder" {
-  bucket  = aws_s3_bucket.raw.id
-  key     = "streams/"
-  content = ""
-
-
-  depends_on = [aws_pipes_pipe.sqs_to_sfn]  
-}
 
 resource "aws_s3_object" "users_folder" {
   bucket  = aws_s3_bucket.raw.id
@@ -135,6 +127,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "archive" {
   rule {
     id     = "move-to-glacier"
     status = "Enabled"
+
+    filter {} # applies to all objects in the bucket
 
     transition {
       days          = 90
@@ -313,6 +307,12 @@ resource "aws_glue_crawler" "raw_crawler" {
   tags = {
     Usage = "Registers raw file schemas into Glue Data Catalog"
   }
+
+  # Wait for IAM policy attachments to propagate before Glue validates S3 targets.
+  depends_on = [
+    aws_iam_role_policy_attachment.glue_service,
+    aws_iam_role_policy_attachment.s3_full,
+  ]
 }
 
 
@@ -337,6 +337,11 @@ resource "aws_glue_crawler" "curated_crawler" {
   tags = {
     Usage = "Keeps Athena partition list up to date after KPI job runs"
   }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.glue_service,
+    aws_iam_role_policy_attachment.s3_full,
+  ]
 }
 
 
@@ -376,44 +381,11 @@ resource "aws_s3_object" "songs_data" {
   }
 }
 
-resource "aws_s3_object" "streams1_data" {
-  bucket = aws_s3_bucket.raw.id
-  key    = "streams/streams1.csv"
-  source = "${path.module}/../data/streams/streams1.csv"
-  etag   = filemd5("${path.module}/../data/streams/streams1.csv")
 
-  tags = {
-    Layer = "bronze"
-  }
 
-  depends_on = [aws_s3_object.streams_folder]
-}
 
-resource "aws_s3_object" "streams2_data" {
-  bucket = aws_s3_bucket.raw.id
-  key    = "streams/streams2.csv"
-  source = "${path.module}/../data/streams/streams2.csv"
-  etag   = filemd5("${path.module}/../data/streams/streams2.csv")
 
-  tags = {
-    Layer = "bronze"
-  }
 
-  depends_on = [aws_s3_object.streams1_data]
-}
-
-resource "aws_s3_object" "streams3_data" {
-  bucket = aws_s3_bucket.raw.id
-  key    = "streams/streams3.csv"
-  source = "${path.module}/../data/streams/streams3.csv"
-  etag   = filemd5("${path.module}/../data/streams/streams3.csv")
-
-  tags = {
-    Layer = "bronze"
-  }
-
-  depends_on = [aws_s3_object.streams2_data]
-}
 
 resource "aws_s3_object" "users_data" {
   bucket = aws_s3_bucket.raw.id
