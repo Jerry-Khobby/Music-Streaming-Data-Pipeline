@@ -2,15 +2,19 @@
 #  STEP FUNCTIONS — State machine + IAM role
 #
 #  Execution order:
-#    0. StartRawCrawler    → fires the Glue raw crawler (auto — no manual step needed)
+#    0. NormalizeInput      → discards raw SQS envelope, replaces with clean {}
+#       CheckAlreadyRunning → lists RUNNING executions for this state machine
+#       IsAnotherRunning    → if another execution is already running, wait and re-check
+#       WaitForPreviousRun  → waits 60 s before re-checking (tune to pipeline duration)
+#    1. StartRawCrawler    → fires the Glue raw crawler (auto — no manual step needed)
 #       WaitForCrawler     → waits 30 s between polls
 #       CheckCrawlerStatus → reads crawler state via AWS SDK
 #       IsCrawlerReady     → loops back if still RUNNING, proceeds when READY
-#    1. ValidateData       → validation_job        (fails fast if schema is wrong)
-#    2. TransformData      → etl_transform_job     (bronze → silver enriched streams)
-#    3. AggregateKPIs      → kpi_aggregation_job   (silver → gold KPIs)
-#    4. LoadDynamoDB       → dynamodb_loader        (gold → DynamoDB tables)
-#    5. ArchiveFiles       → archive_job            (move raw streams to archive)
+#    2. ValidateData       → validation_job        (fails fast if schema is wrong)
+#    3. TransformData      → etl_transform_job     (bronze → silver enriched streams)
+#    4. AggregateKPIs      → kpi_aggregation_job   (silver → gold KPIs)
+#    5. LoadDynamoDB       → dynamodb_loader        (gold → DynamoDB tables)
+#    6. ArchiveFiles       → archive_job            (move raw streams to archive)
 #
 #  Any step failure → NotifyFailure → SNS alert → PipelineFailed (Fail state)
 
@@ -58,16 +62,6 @@ data "aws_iam_policy_document" "sfn_permissions" {
   }
 
   statement {
-    sid    = "ListExecutionsForSingletonGuard"
-    effect = "Allow"
-    actions = [
-      "states:ListExecutions",
-      "states:DescribeExecution",
-    ]
-    resources = ["*"]
-  }
-
-  statement {
     sid       = "SnsPublish"
     effect    = "Allow"
     actions   = ["sns:Publish"]
@@ -101,6 +95,17 @@ data "aws_iam_policy_document" "sfn_permissions" {
     ]
     resources = ["*"]
   }
+
+  # Required so the state machine can list its own running executions
+  # and implement the wait-for-previous-run concurrency guard.
+  statement {
+    sid     = "SelfIntrospect"
+    effect  = "Allow"
+    actions = ["states:ListExecutions"]
+    resources = [
+      "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:stateMachine:${var.project_name}-pipeline"
+    ]
+  }
 }
 
 resource "aws_iam_role_policy" "sfn_permissions" {
@@ -117,28 +122,45 @@ locals {
     Comment = "Music Streaming ETL Pipeline — orchestrates 5 Glue jobs in sequence"
     StartAt = "NormalizeInput"
 
+    # The Pipe passes the SQS batch as a raw array regardless of provider version.
+    # This Pass state uses Parameters = {} to discard the entire array input
+    # and replace it with a clean empty object before any ResultPath writes happen.
+    # Parameters = {} is different from InputPath — it does not extract from the
+    # input, it completely replaces it, which is what we need here.
+
     States = {
 
-      # EventBridge Pipes delivers the SQS record as an array [{}].
-      # $[0] unwraps it into a plain object so all ResultPath writes succeed.
+      # ── CONCURRENCY GUARD ──────────────────────────────────────────────────
+      # Multiple S3 uploads can trigger multiple executions in quick succession.
+      # Each Glue job has max_concurrent_runs = 1, so a second execution trying
+      # to start the same job will get ConcurrentRunsExceededException.
+      #
+      # Instead of aborting, we poll until the earlier execution finishes,
+      # then proceed normally — all uploaded files are picked up in one run.
+      #
+      # How it works:
+      #   ListExecutions returns up to 2 RUNNING executions (MaxResults = 2).
+      #   If Executions[1] is present, at least 2 executions are running — we
+      #   are the newer one, so we wait 60 s and check again.
+      #   Once the previous run finishes, Executions[1] disappears and we
+      #   fall through to StartRawCrawler.
+
       NormalizeInput = {
         Type       = "Pass"
         Parameters = {}
-        Next       = "CheckRunningExecutions"
+        Next       = "CheckAlreadyRunning"
       }
-      # Singleton guard — when 3 stream files upload in quick succession the Pipe
-      # spawns 3 executions. The first does the work; the others see a running
-      # peer and exit immediately, preventing Glue concurrent-run failures.
-      CheckRunningExecutions = {
+
+      CheckAlreadyRunning = {
         Type     = "Task"
         Resource = "arn:aws:states:::aws-sdk:sfn:listExecutions"
         Parameters = {
           StateMachineArn = "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:stateMachine:${var.project_name}-pipeline"
           StatusFilter    = "RUNNING"
-          MaxResults      = 10
+          MaxResults      = 2
         }
-        ResultPath = "$.peers"
-        Next       = "IsAnotherExecutionRunning"
+        ResultPath = "$.runningCheck"
+        Next       = "IsAnotherRunning"
         Catch = [{
           ErrorEquals = ["States.ALL"]
           ResultPath  = "$.error"
@@ -146,21 +168,29 @@ locals {
         }]
       }
 
-      # If more than one execution is in RUNNING state (this one + at least one peer),
-      # exit gracefully so the active execution can complete.
-      IsAnotherExecutionRunning = {
+      IsAnotherRunning = {
         Type = "Choice"
         Choices = [{
-          Variable  = "$.peers.Executions[1].ExecutionArn"
+          # Executions[1] existing means 2+ executions are running — we are the
+          # newer one, so yield and wait for the previous run to finish.
+          Variable  = "$.runningCheck.Executions[1]"
           IsPresent = true
-          Next      = "PipelineSkipped"
+          Next      = "WaitForPreviousRun"
         }]
+        # Only one execution running (us) — safe to proceed.
         Default = "StartRawCrawler"
       }
 
-      PipelineSkipped = {
-        Type = "Succeed"
+      WaitForPreviousRun = {
+        # Poll every 60 s. Tune this to roughly half your typical pipeline
+        # duration — shorter means faster start after the previous run ends,
+        # but more Step Functions state-transition cost while waiting.
+        Type    = "Wait"
+        Seconds = 60
+        Next    = "CheckAlreadyRunning"
       }
+
+      # ── CRAWLER ───────────────────────────────────────────────────────────
 
       StartRawCrawler = {
         Type     = "Task"
@@ -217,6 +247,8 @@ locals {
         ]
         Default = "WaitForCrawler"
       }
+
+      # ── GLUE JOBS ─────────────────────────────────────────────────────────
 
       ValidateData = {
         Type     = "Task"
@@ -317,6 +349,8 @@ locals {
           Next        = "NotifyFailure"
         }]
       }
+
+      # ── FAILURE HANDLING ──────────────────────────────────────────────────
 
       NotifyFailure = {
         Type     = "Task"

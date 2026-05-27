@@ -33,6 +33,9 @@ resource "aws_cloudwatch_metric_alarm" "sfn_execution_failed" {
   dimensions = {
     StateMachineArn = aws_sfn_state_machine.pipeline.arn
   }
+
+  alarm_actions = [aws_sns_topic.pipeline_alerts.arn]
+  ok_actions    = [aws_sns_topic.pipeline_alerts.arn]
 }
 
 # 2. Step Functions execution timed out
@@ -52,6 +55,8 @@ resource "aws_cloudwatch_metric_alarm" "sfn_execution_timed_out" {
   dimensions = {
     StateMachineArn = aws_sfn_state_machine.pipeline.arn
   }
+
+  alarm_actions = [aws_sns_topic.pipeline_alerts.arn]
 }
 
 # 3. Dead-letter queue has messages — poison events that EventBridge gave up on
@@ -71,6 +76,8 @@ resource "aws_cloudwatch_metric_alarm" "sqs_dlq_has_messages" {
   dimensions = {
     QueueName = aws_sqs_queue.pipeline_dlq.name
   }
+
+  alarm_actions = [aws_sns_topic.pipeline_alerts.arn]
 }
 
 # 4. Main queue backed up — messages older than 15 minutes mean the Pipe isn't draining
@@ -79,7 +86,7 @@ resource "aws_cloudwatch_metric_alarm" "sqs_messages_stuck" {
   alarm_description   = "Messages in the main queue are >15 min old — Pipe may be unhealthy or state machine is throttled"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 3
-  threshold           = 900 # seconds
+  threshold           = 900
   treat_missing_data  = "notBreaching"
 
   metric_name = "ApproximateAgeOfOldestMessage"
@@ -90,16 +97,18 @@ resource "aws_cloudwatch_metric_alarm" "sqs_messages_stuck" {
   dimensions = {
     QueueName = aws_sqs_queue.pipeline_events.name
   }
+
+  alarm_actions = [aws_sns_topic.pipeline_alerts.arn]
 }
 
 # 5. Per-Glue-job failure alarms — useful for pinpointing WHICH job broke
 locals {
   glue_jobs_to_monitor = {
-    validation       = aws_glue_job.validation.name
-    etl_transform    = aws_glue_job.etl_transform.name
-    kpi_aggregation  = aws_glue_job.kpi_aggregation.name
-    dynamodb_loader  = aws_glue_job.dynamodb_loader.name
-    archive          = aws_glue_job.archive.name
+    validation      = aws_glue_job.validation.name
+    etl_transform   = aws_glue_job.etl_transform.name
+    kpi_aggregation = aws_glue_job.kpi_aggregation.name
+    dynamodb_loader = aws_glue_job.dynamodb_loader.name
+    archive         = aws_glue_job.archive.name
   }
 }
 
@@ -119,9 +128,41 @@ resource "aws_cloudwatch_metric_alarm" "glue_job_failed" {
   statistic   = "Sum"
 
   dimensions = {
-    JobName = each.value
+    JobName  = each.value
     JobRunId = "ALL"
     Type     = "gauge"
+  }
+
+  alarm_actions = [aws_sns_topic.pipeline_alerts.arn]
+}
+
+
+
+resource "aws_cloudwatch_event_rule" "pipeline_succeeded" {
+  name        = "${var.project_name}-pipeline-succeeded"
+  description = "Fires when a pipeline execution completes successfully"
+
+  event_pattern = jsonencode({
+    source        = ["aws.states"]
+    "detail-type" = ["Step Functions Execution Status Change"]
+    detail = {
+      stateMachineArn = [aws_sfn_state_machine.pipeline.arn]
+      status          = ["SUCCEEDED"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "pipeline_succeeded_sns" {
+  rule      = aws_cloudwatch_event_rule.pipeline_succeeded.name
+  target_id = "SuccessAlert"
+  arn       = aws_sns_topic.pipeline_alerts.arn
+
+  input_transformer {
+    input_paths = {
+      execution = "$.detail.executionArn"
+      time      = "$.time"
+    }
+    input_template = "\"✅ Pipeline SUCCEEDED at <time>. All KPIs computed and loaded to DynamoDB. Execution: <execution>\""
   }
 }
 
@@ -141,7 +182,7 @@ resource "aws_cloudwatch_event_rule" "alarm_state_change" {
   description = "Catches ALARM transitions for this pipeline's CloudWatch alarms and reshapes them before SNS forwards them"
 
   event_pattern = jsonencode({
-    source       = ["aws.cloudwatch"]
+    source        = ["aws.cloudwatch"]
     "detail-type" = ["CloudWatch Alarm State Change"]
     detail = {
       state = {
@@ -243,7 +284,7 @@ resource "aws_chatbot_slack_channel_configuration" "pipeline_alerts" {
 
   sns_topic_arns = [aws_sns_topic.pipeline_alerts.arn]
 
-  logging_level     = "INFO"
+  logging_level         = "INFO"
   guardrail_policy_arns = ["arn:aws:iam::aws:policy/ReadOnlyAccess"]
 
   tags = {
