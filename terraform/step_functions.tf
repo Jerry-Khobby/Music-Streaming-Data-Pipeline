@@ -1,20 +1,22 @@
-
 #  STEP FUNCTIONS — State machine + IAM role
 #
 #  Execution order:
-#    0. NormalizeInput      → discards raw SQS envelope, replaces with clean {}
-#       CheckAlreadyRunning → lists RUNNING executions for this state machine
-#       IsAnotherRunning    → if another execution is already running, wait and re-check
-#       WaitForPreviousRun  → waits 60 s before re-checking (tune to pipeline duration)
-#    1. StartRawCrawler    → fires the Glue raw crawler (auto — no manual step needed)
-#       WaitForCrawler     → waits 30 s between polls
-#       CheckCrawlerStatus → reads crawler state via AWS SDK
-#       IsCrawlerReady     → loops back if still RUNNING, proceeds when READY
-#    2. ValidateData       → validation_job        (fails fast if schema is wrong)
-#    3. TransformData      → etl_transform_job     (bronze → silver enriched streams)
-#    4. AggregateKPIs      → kpi_aggregation_job   (silver → gold KPIs)
-#    5. LoadDynamoDB       → dynamodb_loader        (gold → DynamoDB tables)
-#    6. ArchiveFiles       → archive_job            (move raw streams to archive)
+#    0. NormalizeInput       → discards raw SQS envelope, replaces with clean {}
+#       CheckAlreadyRunning  → lists RUNNING executions for this state machine
+#       IsAnotherRunning     → if another execution is already running, wait and re-check
+#       WaitForPreviousRun   → waits 60 s before re-checking (tune to pipeline duration)
+#    1. StartRawCrawler      → fires the Glue raw crawler
+#       WaitForCrawler       → waits 45 s between polls
+#       CheckCrawlerStatus   → reads crawler state via AWS SDK
+#       IsCrawlerReady       → loops back if still RUNNING, proceeds when READY
+#       CheckStreamsExist     → inspects S3 for files under streams/ before running jobs
+#       AreThereStreams       → exits cleanly (Succeed) if no files found
+#    2. ValidateData         → validation_job        (fails fast if schema is wrong)
+#    3. TransformData        → etl_transform_job     (bronze → silver enriched streams)
+#    4. AggregateKPIs        → kpi_aggregation_job   (silver → gold KPIs)
+#    5. LoadDynamoDB         → dynamodb_loader        (gold → DynamoDB tables)
+#    6. StartCuratedCrawler  → refreshes Athena gold/ partitions (non-fatal)
+#    7. ArchiveFiles         → archive_job            (move raw streams to archive)
 #
 #  Any step failure → NotifyFailure → SNS alert → PipelineFailed (Fail state)
 
@@ -106,6 +108,22 @@ data "aws_iam_policy_document" "sfn_permissions" {
       "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:stateMachine:${var.project_name}-pipeline"
     ]
   }
+
+  # Required so the state machine can check S3 for stream files before
+  # running any Glue jobs — allows a clean early-exit when streams/ is empty.
+  statement {
+    sid     = "S3ListStreams"
+    effect  = "Allow"
+    actions = ["s3:ListBucket"]
+    resources = [
+      "arn:aws:s3:::${var.raw_bucket_name}-${var.environment}"
+    ]
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["streams/*"]
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "sfn_permissions" {
@@ -122,18 +140,23 @@ locals {
     Comment = "Music Streaming ETL Pipeline — orchestrates 5 Glue jobs in sequence"
     StartAt = "NormalizeInput"
 
-    # The Pipe passes the SQS batch as a raw array regardless of provider version.
-    # This Pass state uses Parameters = {} to discard the entire array input
-    # and replace it with a clean empty object before any ResultPath writes happen.
-    # Parameters = {} is different from InputPath — it does not extract from the
-    # input, it completely replaces it, which is what we need here.
-
     States = {
+
+      # ── INPUT NORMALIZATION ────────────────────────────────────────────────
+      # The Pipe passes the SQS batch as a raw array regardless of provider
+      # version.  Parameters = {} completely replaces the input with a clean
+      # empty object before any ResultPath writes happen.
+
+      NormalizeInput = {
+        Type       = "Pass"
+        Parameters = {}
+        Next       = "CheckAlreadyRunning"
+      }
 
       # ── CONCURRENCY GUARD ──────────────────────────────────────────────────
       # Multiple S3 uploads can trigger multiple executions in quick succession.
-      # Each Glue job has max_concurrent_runs = 1, so a second execution trying
-      # to start the same job will get ConcurrentRunsExceededException.
+      # Each Glue job allows concurrent runs, but running two full pipelines at
+      # the same time wastes DPU hours and can cause data races in silver/gold.
       #
       # Instead of aborting, we poll until the earlier execution finishes,
       # then proceed normally — all uploaded files are picked up in one run.
@@ -144,12 +167,6 @@ locals {
       #   are the newer one, so we wait 60 s and check again.
       #   Once the previous run finishes, Executions[1] disappears and we
       #   fall through to StartRawCrawler.
-
-      NormalizeInput = {
-        Type       = "Pass"
-        Parameters = {}
-        Next       = "CheckAlreadyRunning"
-      }
 
       CheckAlreadyRunning = {
         Type     = "Task"
@@ -182,8 +199,8 @@ locals {
       }
 
       WaitForPreviousRun = {
-        # Poll every 60 s. Tune this to roughly half your typical pipeline
-        # duration — shorter means faster start after the previous run ends,
+        # Poll every 60 s.  Tune this to roughly half your typical pipeline
+        # duration — shorter means a faster start after the previous run ends,
         # but more Step Functions state-transition cost while waiting.
         Type    = "Wait"
         Seconds = 60
@@ -217,7 +234,7 @@ locals {
 
       WaitForCrawler = {
         Type    = "Wait"
-        Seconds = 30
+        Seconds = 45
         Next    = "CheckCrawlerStatus"
       }
 
@@ -242,10 +259,64 @@ locals {
           {
             Variable     = "$.crawlerStatus.Crawler.State"
             StringEquals = "READY"
-            Next         = "ValidateData"
+            Next         = "CheckStreamsExist"
           }
         ]
         Default = "WaitForCrawler"
+      }
+
+      # ── STREAMS EXISTENCE CHECK ────────────────────────────────────────────
+      # After the crawler finishes, verify there are actual CSV files under
+      # streams/ before spending DPU time on Glue jobs.
+      #
+      # Why this matters:
+      #   The Glue crawler registers the streams table schema from whatever
+      #   files existed at crawl time.  If streams/ was empty when it ran
+      #   (e.g. the previous archive job moved all files out before this
+      #   crawler re-ran) the table is registered with ZERO columns.
+      #   The validation job exits cleanly (NoNewStreams), but etl_transform
+      #   loads the same stale catalog entry and crashes with:
+      #     "streams is missing required columns: {listen_time, user_id, track_id}"
+      #   because the DataFrame literally has no columns.
+      #
+      # Checking S3 directly here is the authoritative source of truth —
+      # if no objects exist under streams/ there is nothing to process and
+      # we exit cleanly (Succeed) without starting any Glue job.
+
+      CheckStreamsExist = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::aws-sdk:s3:listObjectsV2"
+        Parameters = {
+          Bucket  = "${var.raw_bucket_name}-${var.environment}"
+          Prefix  = "streams/"
+          MaxKeys = 1
+        }
+        ResultPath = "$.streamsCheck"
+        Next       = "AreThereStreams"
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = "$.error"
+          Next        = "NotifyFailure"
+        }]
+      }
+
+      AreThereStreams = {
+        Type = "Choice"
+        Choices = [
+          {
+            # KeyCount > 0 means at least one object exists under streams/ — proceed.
+            Variable           = "$.streamsCheck.KeyCount"
+            NumericGreaterThan = 0
+            Next               = "ValidateData"
+          }
+        ]
+        # No files found — nothing to process.  Exit cleanly so the CloudWatch
+        # alarm does not fire and the SNS alert does not send a false failure.
+        Default = "NoStreamsToProcess"
+      }
+
+      NoStreamsToProcess = {
+        Type = "Succeed"
       }
 
       # ── GLUE JOBS ─────────────────────────────────────────────────────────
@@ -311,7 +382,7 @@ locals {
       }
 
       # Refresh Athena partitions for gold/ so analysts can query the new KPIs
-      # immediately. Failure here is non-fatal — Athena queries will just miss
+      # immediately.  Failure here is non-fatal — Athena queries will just miss
       # the latest partition until the next run.
       StartCuratedCrawler = {
         Type     = "Task"
