@@ -104,7 +104,7 @@ correct partition, and returns the item. One API call, O(1) time, no scan.
 There is exactly one KPI record per genre per day. A composite key of genre + date already
 uniquely identifies the item. Adding a sort key would add structural complexity with no benefit.
 
-**Terraform definition (`main.tf:143–160`):**
+**Terraform definition (`main.tf:146–163`):**
 ```hcl
 resource "aws_dynamodb_table" "genre_kpis" {
   name         = "genre_kpis"
@@ -183,7 +183,7 @@ The `dropDuplicates` mirrors the primary key — it ensures that if the pipeline
 the same date, `put_item` is idempotent (same key = same item overwrites itself with the same
 data).
 
-**Terraform definition (`main.tf:166–189`):**
+**Terraform definition (`main.tf:169–192`):**
 ```hcl
 resource "aws_dynamodb_table" "top_songs" {
   name         = "top_songs"
@@ -275,7 +275,7 @@ topGenresDF = loadParquet(spark, f"{goldBase}/top_genres").dropDuplicates(["date
 `date + rank` is unique — there is one genre at rank 1 for any given day. The deduplication
 enforces this before writing, making repeated pipeline runs for the same date idempotent.
 
-**Terraform definition (`main.tf:195–218`):**
+**Terraform definition (`main.tf:198–221`):**
 ```hcl
 resource "aws_dynamodb_table" "top_genres" {
   name         = "top_genres"
