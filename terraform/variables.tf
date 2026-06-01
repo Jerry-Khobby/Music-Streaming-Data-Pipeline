@@ -128,3 +128,16 @@ variable "aws_account_id" {
   type        = string
   default     = ""
 }
+
+# ── Direct Slack webhook ─────────────────────────────────────────────────────
+# Incoming webhook URL used by Glue jobs to post failure alerts directly to
+# Slack — no AWS Chatbot or SNS required.  Set this to the SLACK_APP_WEBHOOK_URL
+# value from your .env file.  Leave empty to disable in-job Slack alerts
+# (CloudWatch → Chatbot alerts still work independently).
+
+variable "slack_webhook_url" {
+  description = "Slack incoming webhook URL for direct failure alerts from Glue jobs (SLACK_APP_WEBHOOK_URL from .env)"
+  type        = string
+  default     = ""
+  sensitive   = true
+}

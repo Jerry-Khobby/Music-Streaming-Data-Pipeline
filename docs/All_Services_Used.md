@@ -19,7 +19,7 @@ Every service below is backed by a real resource in the [terraform/](../terrafor
 Before the per-service detail, here is the end-to-end flow so each service has a place in your
 mental model:
 
-```
+```text
  [Producer script] → Kinesis Data Firehose → lands a JSON batch file
         │
         ▼
@@ -35,21 +35,21 @@ mental model:
                                                                           ┌────────▼────────┐
                                                                           │ Step Functions  │  ◀── the orchestrator
                                                                           └────────┬────────┘
-        ┌──────────────────────────────────────────────────────────────────────── │ ───────────────┐
-        ▼                          ▼                       ▼                        ▼                 ▼
- ┌────────────┐           ┌────────────────┐      ┌──────────────┐         ┌──────────────┐   ┌──────────┐
- │ Glue Crawler│  schema  │   Glue Jobs     │ data │  Amazon S3    │  load   │   DynamoDB    │   │   SNS     │
- │ + Data      │ ───────▶ │ (validate→...→  │────▶ │ silver/ gold/ │ ──────▶ │ (3 tables)    │   │ (alerts)  │
- │ Catalog     │          │  archive)       │      │  archive      │         └──────────────┘   └────┬─────┘
- └────────────┘           └────────────────┘      └──────────────┘                                  │
-        ▲                                                                                  ┌──────────┴─────────┐
-        │ all steps logged / alarmed                                                       ▼                    ▼
- ┌──────────────────────────────────────────┐                                      ┌──────────┐         ┌──────────┐
- │           Amazon CloudWatch               │                                      │ AWS      │         │  Email   │
- │  (log groups · metrics · alarms)          │──── alarm fires ────▶ SNS ──────────▶│ Chatbot  │         │  (SNS    │
- └──────────────────────────────────────────┘                                      │ → Slack  │         │  sub)    │
-                                                                                    └──────────┘         └──────────┘
-
+        ┌──────────────────────────────────────────────────────────────────────── │ ────────────────────────────┐
+        ▼                          ▼                       ▼                        ▼                  ▼           ▼
+ ┌────────────┐           ┌────────────────┐      ┌──────────────┐         ┌──────────────┐   ┌──────────┐  ┌──────────┐
+ │ Glue Crawler│  schema  │   Glue Jobs     │ data │  Amazon S3    │  load   │   DynamoDB    │   │   SNS     │  │  Lambda  │
+ │ + Data      │ ───────▶ │ (validate→...→  │────▶ │ silver/ gold/ │ ──────▶ │ (3 tables)    │   │ (alerts)  │  │notifier  │
+ │ Catalog     │          │  archive)       │      │  archive      │         └──────────────┘   └────┬─────┘  └────┬─────┘
+ └────────────┘           └──────┬──────────┘      └──────────────┘                                  │             │
+                                  │ stage hooks — direct webhook                              ┌────────┴─────────────┘
+        ▲                         └─────────────────────────────────────────────────────────▶│   Slack channel       │
+        │ all steps logged / alarmed                                                          │ (direct webhook path) │
+ ┌──────────────────────────────────────────┐                                                └───────────────────────┘
+ │           Amazon CloudWatch               │                        ┌────────────────────────────────────────────────┐
+ │  (log groups · metrics · alarms)          │── alarm fires ──▶ SNS ─┤─ Chatbot ──▶ Slack   (CloudWatch / SNS path)  │
+ └──────────────────────────────────────────┘                        └─ Email                                          │
+                                                                      └────────────────────────────────────────────────┘
  Underneath everything:  IAM (permissions) · Terraform (provisions it all)
 ```
 
@@ -57,9 +57,10 @@ There are two broad groups of services:
 
 - **The data path** — S3, Glue (Crawler, Catalog, Jobs), DynamoDB. This is where data actually
   moves and transforms.
-- **The control & glue path** — EventBridge, SQS, EventBridge Pipes, Step Functions, SNS,
-  CloudWatch, Chatbot, IAM. This is what *triggers*, *orchestrates*, *monitors*, and *secures* the
-  data path.
+- **The control & orchestration path** — EventBridge, SQS, EventBridge Pipes, Step Functions, IAM.
+  This is what *triggers* and *orchestrates* the data path.
+- **The observability & alerting path** — CloudWatch, SNS, Chatbot for infrastructure-level alarms;
+  Lambda + direct Slack webhook for real-time in-flight stage and pipeline notifications.
 
 ---
 
@@ -71,6 +72,7 @@ the network. It is the de-facto storage foundation of nearly every data lake on 
 
 **What problem it solves here.** S3 is the home for *all* the pipeline's data at every stage. The
 project uses three buckets:
+
 - **raw** (`aws_s3_bucket.raw`, [main.tf:10](../terraform/main.tf#L10)) — the Bronze landing zone
   where incoming CSVs arrive under `songs/`, `users/`, `streams/`.
 - **curated** ([main.tf:64](../terraform/main.tf#L64)) — holds the Silver (`silver/`) and Gold
@@ -222,6 +224,7 @@ flexible front door for AWS events.
 holds messages until something is ready to process them.
 
 **What problem it solves here.** Two queues ([messaging.tf:65](../terraform/messaging.tf#L65)):
+
 - **main queue** (`pipeline_events`) buffers S3 upload events between EventBridge and Step
   Functions, so a burst of uploads can't overwhelm the system — they queue up and are processed one
   at a time.
@@ -263,10 +266,13 @@ is the single place failures and successes are published. Both Step Functions (`
 CloudWatch alarms publish to it, and it fans out to **email** subscribers and to **AWS Chatbot →
 Slack**.
 
-**Why over alternatives.** You could email or message Slack directly from each source, but that
-scatters notification logic everywhere. SNS was chosen as a **single hub**: every alert source
-publishes to one topic, and you add/remove subscribers (a new email, a new Slack channel) without
-touching the pipeline.
+**Why over alternatives.** You could message Slack or email directly from each source, but that
+scatters notification logic everywhere. SNS was chosen as the **infrastructure-level hub**: every
+CloudWatch alarm and the state machine's `NotifyFailure` step publish to one topic, and you
+add/remove subscribers without touching the pipeline. Note that SNS covers the *infrastructure*
+alert path (failures, timeouts, stuck queues); a second, independent path uses a **direct Slack
+webhook** from the Glue jobs (`PipelineMonitor`) and the `pipeline_notifier` Lambda for richer,
+in-flight stage and pipeline progress messages (see section 10a).
 
 ---
 
@@ -286,6 +292,54 @@ access to enrich alerts with metric snapshots.
 
 ---
 
+## 10a. AWS Lambda — Pipeline-level Slack Notifier
+
+**What it is.** AWS Lambda runs a single Python function on demand with no servers to provision or
+maintain. It is invoked by name, executes, and returns — billing only for the milliseconds it runs.
+
+**What problem it solves here.** The `pipeline_notifier` Lambda
+([lambda/pipeline_notifier.py](../lambda/pipeline_notifier.py)) is the **pipeline-level half** of
+the two-channel Slack notification architecture. It is invoked by three dedicated Step Functions
+states and posts rich Slack Block Kit messages (coloured attachments, bold headers, named fields)
+directly to the `SLACK_APP_WEBHOOK_URL` endpoint:
+
+| Step Functions state | When it fires | Slack message |
+| --- | --- | --- |
+| `NotifyPipelineStarted` | After concurrency guard passes, before `StartRawCrawler` | `:rocket: Pipeline — Started` with execution ID and timestamp |
+| `NotifyPipelineSucceeded` | After `ArchiveFiles` succeeds | `:large_green_circle: Pipeline — Succeeded` with execution ID |
+| `NotifySlackPipelineFailed` | After `NotifyFailure` (SNS), before `PipelineFailed` | `:red_circle: Pipeline — FAILED` with failed step name and error cause |
+
+All three states catch their own errors and route to the next pipeline state — a Slack delivery
+failure can never block or fail the execution. The `requests` library is intentionally avoided;
+the function uses Python's built-in `urllib.request` so no Lambda layer or packaging is needed.
+
+This Lambda complements the job-level notifications already in `monitoring/pipeline_monitor.py`:
+each Glue job's `PipelineMonitor` stage hooks call `SlackNotifier` directly for per-stage
+start/success/fail messages. Together the two components give a complete picture of every run in
+Slack from first state to last stage.
+
+**Why Lambda over alternatives.**
+
+- **Direct HTTP call from Step Functions?** Step Functions can call HTTPS endpoints via
+  `arn:aws:states:::http:invoke`, but constructing and signing the Slack Block Kit payload inside
+  an ASL `Parameters` block is impractical — it becomes a maintenance burden. Lambda lets the
+  payload logic live in version-controlled Python.
+- **SNS for this path too?** SNS's email/Chatbot formatting is generic plain text. The webhook path
+  was specifically chosen for the richer Slack Block Kit format — colours, named fields, structured
+  attachments — which SNS cannot produce.
+- **Why not put it in one of the Glue jobs?** Pipeline-level events (start, end) happen at the
+  Step Functions level, not inside any individual job. Lambda is the right invocation unit for
+  Step Functions to call.
+
+**Terraform resource.** Defined in [terraform/lambda.tf](../terraform/lambda.tf). The `archive_file`
+data source packages `lambda/pipeline_notifier.py` into a zip at plan time; `source_code_hash`
+ensures Lambda is re-deployed whenever the code changes. IAM uses the
+`AWSLambdaBasicExecutionRole` managed policy — CloudWatch Logs only, no other permissions needed.
+The Step Functions role has an additional `lambda:InvokeFunction` statement scoped to this
+function's ARN.
+
+---
+
 ## 11. Amazon CloudWatch — Logs, Metrics, and Alarms
 
 **What it is.** CloudWatch is the AWS **observability** service: it stores logs (`log groups`),
@@ -293,6 +347,7 @@ collects numeric `metrics`, and runs `alarms` that react when a metric crosses a
 
 **What problem it solves here.** It is how the pipeline is watched and debugged
 ([monitoring.tf](../terraform/monitoring.tf), [main.tf:350](../terraform/main.tf#L350)):
+
 - **Log groups** `/aws/glue/<project>` and `/aws/states/<project>` capture every Glue job line and
   every Step Functions transition.
 - **Alarms** watch Step Functions failures/timeouts, SQS queue depth/age, and per-Glue-job task
@@ -313,6 +368,7 @@ would add cost and integration work for what CloudWatch already does inside the 
 
 **What problem it solves here.** Every service that acts on another needs a role scoped to exactly
 what it must do, following least-privilege:
+
 - a **Glue role** the jobs/crawlers assume to read/write S3, the Catalog, and DynamoDB;
 - a **Step Functions role** (`sfn_role`) allowed to start Glue jobs/crawlers, list executions,
   read S3, and publish to SNS;
@@ -352,7 +408,7 @@ the infrastructure is version-controlled and auditable like the application code
 ## 14. Service Inventory at a Glance
 
 | Service | Role in pipeline | Chosen over | Key resource |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Amazon S3** | Stores all data: raw, silver/gold, archive; fires the trigger event | Loading straight to a DB | `aws_s3_bucket.{raw,curated,archive}` |
 | **Kinesis Data Firehose** | Ingests producer events, batches them into S3 files | Kinesis Data Streams / direct-to-S3 | `aws_kinesis_firehose_delivery_stream.streams_ingestion` |
 | **Glue Crawler** | Infers schema, registers catalog tables | Hard-coding schemas | `aws_glue_crawler.{raw,curated}_crawler` |
@@ -363,8 +419,9 @@ the infrastructure is version-controlled and auditable like the application code
 | **EventBridge (rule)** | Detects new S3 uploads, routes them | Direct S3→Lambda/SNS | `aws_cloudwatch_event_rule.streams_uploaded` |
 | **Amazon SQS** | Buffers events; DLQ catches poison messages | Direct EventBridge→SFN | `aws_sqs_queue.{pipeline_events,pipeline_dlq}` |
 | **EventBridge Pipes** | Connects SQS → Step Functions, no code | A custom Lambda poller | `aws_pipes_pipe.sqs_to_sfn` |
-| **Amazon SNS** | Single hub fanning alerts to email + Slack | Per-source notifications | `aws_sns_topic.pipeline_alerts` |
-| **AWS Chatbot** | Delivers alerts into Slack | Custom Lambda + webhook | `aws_chatbot_slack_channel_configuration.*` |
+| **Amazon SNS** | Infrastructure-level alert hub (failures, alarms) → email + Chatbot | Per-source notifications | `aws_sns_topic.pipeline_alerts` |
+| **AWS Chatbot** | Delivers CloudWatch/SNS alerts into Slack | Custom Lambda + webhook | `aws_chatbot_slack_channel_configuration.*` |
+| **AWS Lambda** | Posts pipeline-level Block Kit messages to Slack at start, success, and failure | Bespoke SNS formatting / API Gateway | `aws_lambda_function.pipeline_notifier` |
 | **Amazon CloudWatch** | Logs, metrics, alarms for the whole pipeline | Third-party observability | `aws_cloudwatch_log_group.*`, `aws_cloudwatch_metric_alarm.*` |
 | **AWS IAM** | Least-privilege roles for every component | Broad admin permissions | `aws_iam_role.*` (5 roles) |
 | **Terraform** | Provisions and version-controls all of the above | Console clicks / CloudFormation | all `.tf` files |

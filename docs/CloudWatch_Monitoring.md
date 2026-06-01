@@ -17,7 +17,7 @@ and [terraform/step_functions.tf](../terraform/step_functions.tf).
 People often blur these together, but they are three different things doing three different jobs:
 
 | Concept | What it is | Question it answers | In this project |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Log group** | A container of timestamped text lines emitted by a service | *"What exactly happened, line by line?"* | `/aws/glue/<project>`, `/aws/states/<project>` |
 | **Metric** | A numeric time series (a number sampled over time) | *"How many / how much / how long?"* | `ExecutionsFailed`, `numFailedTasks`, queue depth/age |
 | **Alarm** | A rule that watches a metric and changes state when it breaches a threshold | *"Should a human be told right now?"* | 5 alarm types → SNS → Slack/email |
@@ -107,7 +107,7 @@ A **metric** is a numeric time series. AWS services publish metrics automaticall
 This project's alarms watch metrics from three namespaces:
 
 | Namespace | Metric | What it measures | Used by alarm |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `AWS/States` | `ExecutionsFailed` | Count of failed state-machine executions | sfn_execution_failed |
 | `AWS/States` | `ExecutionsTimedOut` | Count of executions that hit their timeout | sfn_execution_timed_out |
 | `AWS/SQS` | `ApproximateNumberOfMessagesVisible` | Messages sitting in the dead-letter queue | sqs_dlq_has_messages |
@@ -149,7 +149,12 @@ still fires.
 
 ### Where alarms go — the notification fan-out
 
-```
+This pipeline uses **two independent alert channels**. The CloudWatch alarms described above feed
+the first; a direct Slack webhook used by the Glue jobs and a Lambda function drives the second.
+
+#### Channel 1 — CloudWatch → SNS → email + Chatbot (infrastructure-level)
+
+```text
  CloudWatch metric breaches threshold
    → alarm enters ALARM state
      → SNS topic (pipeline_alerts)
@@ -169,10 +174,26 @@ The alarms publish to the `pipeline_alerts` SNS topic. SNS fans out to two human
   an **input transformer** into plain language — *what fired, why, when, where to look* — including
   a direct console link to the alarm ([monitoring.tf:217](../terraform/monitoring.tf#L217)).
 
-There is also a **success** path: an EventBridge rule (`pipeline_succeeded`,
+There is also a **success** path on this channel: an EventBridge rule (`pipeline_succeeded`,
 [monitoring.tf:141](../terraform/monitoring.tf#L141)) catches the state machine's `SUCCEEDED`
-event and posts a "✅ Pipeline SUCCEEDED … All KPIs computed and loaded to DynamoDB" message, so
-operators get positive confirmation, not just failure noise.
+event and posts a "✅ Pipeline SUCCEEDED" message via SNS/Chatbot.
+
+#### Channel 2 — Direct Slack webhook (in-flight, stage-granular)
+
+```text
+ Glue job stage starts/ends → PipelineMonitor hook → SlackNotifier → Slack webhook
+ Pipeline starts            → NotifyPipelineStarted Lambda          → Slack webhook
+ Pipeline succeeds          → NotifyPipelineSucceeded Lambda        → Slack webhook
+ Pipeline fails             → NotifySlackPipelineFailed Lambda      → Slack webhook
+                              (chained after NotifyFailure SNS step)
+```
+
+The `monitoring/` Python package (`PipelineMonitor` + `SlackNotifier`) is imported by all five Glue
+jobs. It wraps every stage in a context manager that calls the Slack webhook directly on start,
+success, and failure — no SNS or CloudWatch involved. Pipeline-level messages (started / succeeded /
+failed) are sent by `lambda/pipeline_notifier.py`, invoked from three dedicated Step Functions states.
+This channel provides live, stage-granular Block Kit messages as the run progresses, complementing the
+infrastructure-level coverage of Channel 1.
 
 ---
 
@@ -221,7 +242,7 @@ The per-job alarm tells you which job; now read its logs in `/aws/glue/<project>
    - The **executor** streams hold per-task Spark errors (data skew, OOM, serialization).
    - The **job-insights** stream (enabled via `--enable-job-insights`) summarizes the probable root
      cause in plain language.
-3. The alarm description itself points you here: *"check /aws/glue/<project> logs"*
+3. The alarm description itself points you here: *"check /aws/glue/\<project\> logs"*
    ([monitoring.tf:119](../terraform/monitoring.tf#L119)).
 
 ### Step 4 — If it's an SQS alarm, inspect the queues
@@ -244,11 +265,12 @@ EventBridge rule posting the ✅ message, and by the alarms returning to `OK` st
 ## 6. Summary
 
 | CloudWatch piece | This project's implementation |
-|---|---|
+| --- | --- |
 | **Log groups** | `/aws/glue/<project>` (all 5 jobs, continuous logs + job insights) and `/aws/states/<project>` (full execution data + X-Ray), 30-day retention |
 | **Metrics watched** | `AWS/States` (failed, timed out), `AWS/SQS` (DLQ depth, oldest-message age), `Glue` (per-job failed tasks) |
 | **Alarms** | 5 categories incl. one per Glue job; all publish to the `pipeline_alerts` SNS topic |
-| **Notifications** | SNS → AWS Chatbot → Slack, and EventBridge-reshaped human-readable email; plus a success notification |
+| **Notifications (CloudWatch path)** | SNS → AWS Chatbot → Slack + email; EventBridge-reshaped human-readable alerts; success notification via EventBridge |
+| **Notifications (webhook path)** | `PipelineMonitor` stage hooks in all 5 Glue jobs + `NotifyPipelineStarted/Succeeded/Failed` Lambda states |
 | **Debugging path** | Alarm names the layer → Step Functions graph + execution data → Glue driver/executor/insights logs → root cause |
 
 The result is a pipeline where a failure is detected automatically at whatever layer it occurs,

@@ -58,10 +58,31 @@
         {
           "Variable": "$.crawlerStatus.Crawler.State",
           "StringEquals": "READY",
-          "Next": "ValidateData"
+          "Next": "NotifyPipelineStarted"
         }
       ],
       "Default": "WaitForCrawler"
+    },
+
+    "NotifyPipelineStarted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<pipeline_notifier_lambda_arn>",
+        "Payload": {
+          "event_type": "started",
+          "execution_id.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": null,
+      "Next": "ValidateData",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": null,
+          "Next": "ValidateData"
+        }
+      ]
     },
 
     "ValidateData": {
@@ -144,12 +165,33 @@
         "JobName": "music-streaming-archive"
       },
       "ResultPath": "$.archiveResult",
-      "Next": "PipelineSucceeded",
+      "Next": "NotifyPipelineSucceeded",
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.error",
           "Next": "NotifyFailure"
+        }
+      ]
+    },
+
+    "NotifyPipelineSucceeded": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<pipeline_notifier_lambda_arn>",
+        "Payload": {
+          "event_type": "succeeded",
+          "execution_id.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": null,
+      "Next": "PipelineSucceeded",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": null,
+          "Next": "PipelineSucceeded"
         }
       ]
     },
@@ -164,7 +206,29 @@
         "Message.$": "States.Format('Pipeline failed. Error details: {}', States.JsonToString($.error))"
       },
       "ResultPath": "$.snsResult",
-      "Next": "PipelineFailed"
+      "Next": "NotifySlackPipelineFailed"
+    },
+
+    "NotifySlackPipelineFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<pipeline_notifier_lambda_arn>",
+        "Payload": {
+          "event_type": "failed",
+          "execution_id.$": "$$.Execution.Id",
+          "error.$": "$.error"
+        }
+      },
+      "ResultPath": null,
+      "Next": "PipelineFailed",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": null,
+          "Next": "PipelineFailed"
+        }
+      ]
     },
 
     "PipelineFailed": {

@@ -1,5 +1,4 @@
 import sys
-import logging
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
@@ -7,8 +6,10 @@ from awsglue.job import Job
 from pyspark.sql import DataFrame, functions as F
 from pyspark.sql.utils import AnalysisException
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from monitoring import buildLogger, SlackNotifier, PipelineMonitor
+from monitoring.notifier import resolveWebhookUrl
+
+logger = buildLogger(__name__)
 
 SONGS_COLUMNS           = ["track_id", "track_name", "track_genre", "duration_ms"]
 STREAM_DEDUP_KEY        = ["user_id", "track_id", "listen_time"]
@@ -26,11 +27,10 @@ def load_table(glue_context, database, table_name) -> DataFrame:
 
 
 def validate_columns(df, required, label):
-    """Raise a clear ValueError if any required columns are missing."""
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"{label} is missing required columns: {missing}")
-    logger.info(f"{label} column check passed — found: {set(df.columns)}")
+    logger.info(f"{label} — all required fields are present.")
 
 
 def check_streams_have_data(streams_df):
@@ -48,14 +48,14 @@ def check_streams_have_data(streams_df):
     """
     if not streams_df.columns:
         logger.warning(
-            "streams table has no columns — the Glue catalog schema is stale "
-            "(crawler ran on an empty streams/ prefix). "
-            "Exiting cleanly; no data to process."
+            "The stream table has no columns — the catalog schema is stale. "
+            "The crawler likely ran before any new files landed in S3. "
+            "Nothing to process; exiting cleanly."
         )
         return False
 
     if streams_df.rdd.isEmpty():
-        logger.info("streams table is empty — no new rows to process. Exiting cleanly.")
+        logger.info("No new stream events found. Nothing to process; exiting cleanly.")
         return False
 
     return True
@@ -76,7 +76,7 @@ def load_existing_partitions(spark, path, dates) -> DataFrame | None:
             .filter(F.col("stream_date").isin(dates))
         )
     except AnalysisException:
-        # Silver path does not exist yet on the very first run — that is fine.
+        # Silver path does not exist yet on the very first run.
         return None
 
 
@@ -94,8 +94,8 @@ def merge_and_deduplicate(spark, new_df, silver_path) -> DataFrame:
     row_count  = deduped_df.count()
 
     logger.info(
-        f"Merged {len(affected_dates)} date partition(s); "
-        f"{row_count} rows after deduplication."
+        f"Processed {len(affected_dates)} day(s) of stream data — "
+        f"{row_count:,} unique stream events after removing duplicates."
     )
     return deduped_df
 
@@ -107,7 +107,7 @@ def write_silver(df, path, partition_col):
         .partitionBy(partition_col)
         .parquet(path)
     )
-    logger.info(f"Silver layer written to {path}, partitioned by {partition_col}.")
+    logger.info("Enriched stream data saved to the Silver layer in S3.")
 
 
 if __name__ == "__main__":
@@ -126,39 +126,38 @@ if __name__ == "__main__":
     silver_path = f"s3://{args['curated_bucket']}/silver/enriched_streams"
     database    = args["glue_database"]
 
-    streams_df = load_table(glue_ctx, database, "streams")
-    songs_df   = load_table(glue_ctx, database, "songs")
+    webhookUrl = resolveWebhookUrl(sys.argv)
+    notifier   = SlackNotifier(webhookUrl) if webhookUrl else None
+    monitor    = PipelineMonitor(args["JOB_NAME"], notifier)
 
-    # ── streams guard ────────────────────────────────────────────────────────
-    # Exit cleanly if the catalog schema is stale (no columns) or the table is
-    # empty.  This can happen when:
-    #   • The crawler ran before the new stream files landed in S3.
-    #   • The archive job from the previous run moved all files out before the
-    #     crawler re-ran, leaving an empty prefix which Glue registers with no
-    #     schema.
-    # In both cases there is nothing to transform — commit and exit rather than
-    # crashing with a confusing "missing required columns" ValueError.
+    with monitor.stage("Loading stream and song data from the catalog"):
+        streams_df = load_table(glue_ctx, database, "streams")
+        songs_df   = load_table(glue_ctx, database, "songs")
+
     if not check_streams_have_data(streams_df):
         job.commit()
         sys.exit(0)
 
-    # ── column validation ────────────────────────────────────────────────────
-    validate_columns(streams_df, REQUIRED_STREAM_COLUMNS, "streams")
-    validate_columns(songs_df,   REQUIRED_SONGS_COLUMNS,  "songs")
+    with monitor.stage("Checking that all required fields are present"):
+        validate_columns(streams_df, REQUIRED_STREAM_COLUMNS, "streams")
+        validate_columns(songs_df,   REQUIRED_SONGS_COLUMNS,  "songs")
 
-    enriched_df = build_enriched_streams(streams_df, songs_df)
+    with monitor.stage("Joining stream events with song metadata"):
+        enriched_df = build_enriched_streams(streams_df, songs_df)
 
     if enriched_df.rdd.isEmpty():
         logger.warning(
-            "No rows produced after join — "
-            "all stream track_ids may be absent from the songs table. "
-            "Skipping silver write."
+            "No matching records after join — the stream track IDs may not exist "
+            "in the songs table. Skipping write to the Silver layer."
         )
         job.commit()
         sys.exit(0)
 
-    merged_df = merge_and_deduplicate(spark, enriched_df, silver_path)
-    write_silver(merged_df, silver_path, "stream_date")
+    with monitor.stage("Removing duplicate plays and merging with existing data"):
+        merged_df = merge_and_deduplicate(spark, enriched_df, silver_path)
 
-    logger.info("Bronze → Silver complete. Enriched streams written to silver layer.")
+    with monitor.stage("Writing enriched data to the Silver layer in S3"):
+        write_silver(merged_df, silver_path, "stream_date")
+
+    monitor.logSummary()
     job.commit()

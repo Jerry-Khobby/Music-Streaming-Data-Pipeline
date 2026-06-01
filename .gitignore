@@ -8,7 +8,9 @@ data
 
 
 terraform/.terraform
-terraform/.terraform.lock.hcl 
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+terraform/monitoring_lib.zip
 
 
 data/**

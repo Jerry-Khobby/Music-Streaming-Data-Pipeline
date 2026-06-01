@@ -146,14 +146,17 @@ Here is the full chain of this pipeline, in order
 ```
 NormalizeInput (Pass)
    → CheckAlreadyRunning (Task: list running executions)
+   → FindOldestRunning (Pass: extract oldest running ARN)
    → IsAnotherRunning (Choice)
         ├─ another run active → WaitForPreviousRun (Wait 60s) → back to CheckAlreadyRunning
-        └─ clear → StartRawCrawler (Task: start Glue crawler)
+        └─ clear → NotifyPipelineStarted (Task: Lambda invoke → Slack)
+   → StartRawCrawler (Task: start Glue crawler)
    → WaitForCrawler (Wait 45s)
    → CheckCrawlerStatus (Task: get crawler state)
    → IsCrawlerReady (Choice)
         ├─ state != READY → back to WaitForCrawler   (polling loop)
-        └─ state == READY → CheckStreamsExist (Task: list S3 streams/)
+        └─ state == READY → CheckCatalogTables (Task: Glue GetTable)
+   → CheckStreamsExist (Task: list S3 streams/)
    → AreThereStreams (Choice)
         ├─ no files → NoStreamsToProcess (Succeed)   (clean exit)
         └─ files exist → ValidateData (Task: Glue job)
@@ -162,6 +165,7 @@ NormalizeInput (Pass)
    → LoadDynamoDB (Task: Glue job)
    → StartCuratedCrawler (Task: start Glue crawler — non-fatal)
    → ArchiveFiles (Task: Glue job)
+   → NotifyPipelineSucceeded (Task: Lambda invoke → Slack)
    → PipelineSucceeded (Succeed)
 ```
 
@@ -384,9 +388,17 @@ blanket rule.
 
 ### The failure path itself
 
-When any Catch routes to `NotifyFailure`, that state publishes a formatted message to SNS — which
-fans out to Slack and email — then transitions to `PipelineFailed`, a terminal `Fail` state
-([step_functions.tf:426](../terraform/step_functions.tf#L426)):
+When any Catch routes to `NotifyFailure`, the pipeline sends two alerts in sequence before
+terminating, then transitions to `PipelineFailed`, a terminal `Fail` state:
+
+```text
+NotifyFailure (SNS publish — email + Chatbot)
+   → NotifySlackPipelineFailed (Lambda invoke — rich Block Kit Slack message)
+   → PipelineFailed (Fail)
+```
+
+The first step publishes a plain-text formatted message to SNS, which fans out to email and the AWS
+Chatbot Slack integration ([step_functions.tf](../terraform/step_functions.tf)):
 
 ```hcl
 NotifyFailure = {
@@ -397,15 +409,36 @@ NotifyFailure = {
     Subject     = "❌ Music Streaming Pipeline FAILED"
     "Message.$" = "States.Format('PIPELINE FAILED\n\nError: {}\nCause: {}\n...', $.error.Error, $.error.Cause)"
   }
+  Next = "NotifySlackPipelineFailed"
+}
+```
+
+The second step invokes the `pipeline-notifier` Lambda with the captured `$.error` object. The
+Lambda posts a rich Slack Block Kit message (red header, failed step name, execution ID, timestamp,
+full error cause) directly to the webhook URL ([lambda/pipeline_notifier.py](../lambda/pipeline_notifier.py)):
+
+```hcl
+NotifySlackPipelineFailed = {
+  Type     = "Task"
+  Resource = "arn:aws:states:::lambda:invoke"
+  Parameters = {
+    FunctionName = aws_lambda_function.pipeline_notifier.arn
+    Payload = {
+      "event_type"     = "failed"
+      "execution_id.$" = "$$.Execution.Id"
+      "error.$"        = "$.error"
+    }
+  }
   Next = "PipelineFailed"
 }
 
 PipelineFailed = { Type = "Fail", Error = "PipelineError", Cause = "..." }
 ```
 
-`States.Format(...)` injects the captured `$.error.Error` and `$.error.Cause` into a human-readable
-message with direct console links — so the alert tells you *what* broke and *where to look*, not
-just *that* something broke.
+Both notification states catch their own errors and route forward to `PipelineFailed` — a Slack or
+SNS delivery failure can never block the execution from reaching its terminal state. The two-step
+design is intentional: the SNS path covers email subscribers and the belt-and-suspenders Chatbot
+route; the Lambda path provides the richer, in-execution Slack experience with the Block Kit format.
 
 ---
 
@@ -469,7 +502,8 @@ the primary, event-triggered orchestrator; the Glue Workflow is a simpler on-dem
 | **Wait + Choice loop** | Polls the crawler every 45s until `READY` |
 | **Catch** | Every step catches errors → saves them to `$.error` → routes to `NotifyFailure` (or forward, for non-fatal steps) |
 | **Retry** | Mechanism explained; this pipeline implements equivalent retry via the polling loop and in-job backoff |
-| **Failure path** | `NotifyFailure` (SNS publish) → `PipelineFailed` (Fail) |
+| **Failure path** | `NotifyFailure` (SNS publish) → `NotifySlackPipelineFailed` (Lambda/Slack) → `PipelineFailed` (Fail) |
+| **Pipeline-level Slack** | `NotifyPipelineStarted` and `NotifyPipelineSucceeded` Lambda states bracket the happy path; all three catch their own errors and never block the execution |
 | **Why over manual** | Guaranteed ordering, conditional logic, consistent error handling, full visibility, event-driven, serverless |
 
 The state machine is the brain of the pipeline: it knows the order, waits for each step, decides

@@ -12,3 +12,9 @@ boto3==1.34.69
 # The apache/spark image ships PySpark under Spark's own runtime, not the
 # system pip, so pytest cannot find it without this explicit install.
 pyspark==3.5.0
+
+# Used by monitoring/notifier.py to send Slack failure alerts
+requests==2.31.0
+
+# Load .env credentials when running scripts locally
+python-dotenv==1.0.1

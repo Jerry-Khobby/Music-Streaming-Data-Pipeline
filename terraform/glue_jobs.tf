@@ -1,14 +1,51 @@
+
+
+
+
 #  GLUE JOBS — Scripts + Job definitions + Workflow
 #
 #  Execution order in the workflow:
 #    1. validation_job       → validates raw catalog tables exist and are non-empty
-#    2. etl_transform_job    → joins streams+songs, computes KPIs, writes to gold/
-#    3. dynamodb_loader      → loads gold parquet into DynamoDB tables
-#    4. archive_job          → moves processed raw files to the archive bucket
-#
-#  kpi_aggregation_job is deployed as a standalone job (not in the workflow)
-#  because it reads from silver/enriched_streams, which a separate enrichment
-#  step must write before it can run.
+#    2. etl_transform_job    → joins streams+songs, writes enriched data to silver/
+#    3. kpi_aggregation_job  → reads silver/, computes KPIs, writes to gold/
+#    4. dynamodb_loader      → loads gold parquet into DynamoDB tables
+#    5. archive_job          → moves processed raw files to the archive bucket
+
+
+# ── MONITORING LIBRARY ────────────────────────────────────────────────────────
+# Zips the monitoring/ Python package and uploads it to S3.
+# Every Glue job references it via --extra-py-files so "from monitoring import ..."
+# works inside each script.  Terraform re-zips and re-uploads automatically
+# whenever any source file changes (tracked by etag / output_md5).
+
+data "archive_file" "monitoring_lib" {
+  type        = "zip"
+  output_path = "${path.module}/monitoring_lib.zip"
+
+  source {
+    content  = file("${path.module}/../monitoring/__init__.py")
+    filename = "monitoring/__init__.py"
+  }
+  source {
+    content  = file("${path.module}/../monitoring/logger.py")
+    filename = "monitoring/logger.py"
+  }
+  source {
+    content  = file("${path.module}/../monitoring/notifier.py")
+    filename = "monitoring/notifier.py"
+  }
+  source {
+    content  = file("${path.module}/../monitoring/pipeline_monitor.py")
+    filename = "monitoring/pipeline_monitor.py"
+  }
+}
+
+resource "aws_s3_object" "monitoring_lib" {
+  bucket = aws_s3_bucket.curated.id
+  key    = "scripts/libs/monitoring.zip"
+  source = data.archive_file.monitoring_lib.output_path
+  etag   = data.archive_file.monitoring_lib.output_md5
+}
 
 
 # ── SCRIPT UPLOADS ───────────────────────────────────────────────────────────
@@ -52,8 +89,10 @@ resource "aws_s3_object" "script_kpi_aggregation" {
 
 
 # ── SHARED JOB DEFAULTS ──────────────────────────────────────────────────────
-# All jobs share the same logging, Glue version, and worker configuration.
-# Override per-job below only where needed.
+# All jobs share the same logging, library, and Slack alert configuration.
+# --extra-py-files makes the monitoring/ package importable in every script.
+# --slack_webhook_url is read by resolveWebhookUrl(sys.argv) in each job; an
+# empty string disables in-job alerts without breaking anything.
 
 locals {
   glue_common_args = {
@@ -62,6 +101,8 @@ locals {
     "--enable-continuous-cloudwatch-log" = "true"
     "--continuous-log-logGroup"          = aws_cloudwatch_log_group.glue_jobs.name
     "--TempDir"                          = "s3://${aws_s3_bucket.curated.id}/tmp/"
+    "--extra-py-files"                   = "s3://${aws_s3_bucket.curated.id}/scripts/libs/monitoring.zip"
+    "--slack_webhook_url"                = var.slack_webhook_url
   }
 }
 
@@ -82,10 +123,7 @@ resource "aws_glue_job" "validation" {
   glue_version      = "4.0"
   worker_type       = "G.1X"
   number_of_workers = 2
-  timeout           = 10 # minutes — validation is fast
-
-  # REMOVED: execution_property { max_concurrent_runs = 1 }
-  # Now allows unlimited concurrent runs - Glue will queue automatically
+  timeout           = 10
 
   default_arguments = merge(local.glue_common_args, {
     "--glue_database" = var.glue_database_name
@@ -96,7 +134,7 @@ resource "aws_glue_job" "validation" {
     Step     = "1-validation"
   }
 
-  depends_on = [aws_s3_object.script_validation]
+  depends_on = [aws_s3_object.script_validation, aws_s3_object.monitoring_lib]
 }
 
 
@@ -105,7 +143,7 @@ resource "aws_glue_job" "validation" {
 resource "aws_glue_job" "etl_transform" {
   name        = "${var.project_name}-etl-transform"
   role_arn    = aws_iam_role.glue_role.arn
-  description = "Joins streams+songs, computes genre KPIs, top songs, top genres — writes to gold/"
+  description = "Joins streams+songs, deduplicates, writes enriched data to the Silver layer"
 
   command {
     name            = "glueetl"
@@ -118,9 +156,6 @@ resource "aws_glue_job" "etl_transform" {
   number_of_workers = 2
   timeout           = 30
 
-  # REMOVED: execution_property { max_concurrent_runs = 1 }
-  # Now allows unlimited concurrent runs - Glue will queue automatically
-
   default_arguments = merge(local.glue_common_args, {
     "--glue_database"  = var.glue_database_name
     "--curated_bucket" = aws_s3_bucket.curated.id
@@ -131,7 +166,7 @@ resource "aws_glue_job" "etl_transform" {
     Step     = "2-etl-transform"
   }
 
-  depends_on = [aws_s3_object.script_etl_transform]
+  depends_on = [aws_s3_object.script_etl_transform, aws_s3_object.monitoring_lib]
 }
 
 
@@ -153,9 +188,6 @@ resource "aws_glue_job" "dynamodb_loader" {
   number_of_workers = 2
   timeout           = 30
 
-  # REMOVED: execution_property { max_concurrent_runs = 1 }
-  # Now allows unlimited concurrent runs - Glue will queue automatically
-
   default_arguments = merge(local.glue_common_args, {
     "--curated_bucket" = aws_s3_bucket.curated.id
     "--aws_region"     = var.aws_region
@@ -166,13 +198,11 @@ resource "aws_glue_job" "dynamodb_loader" {
     Step     = "3-dynamodb-loader"
   }
 
-  depends_on = [aws_s3_object.script_dynamodb_loader]
+  depends_on = [aws_s3_object.script_dynamodb_loader, aws_s3_object.monitoring_lib]
 }
 
 
-# ── GLUE JOB 4 — archive_job (Python Shell) ──────────────────────────────────
-# Pure boto3 S3 operations — no Spark needed. Python Shell starts in seconds
-# vs. minutes for a Spark cluster, and costs ~4x less per run.
+# ── GLUE JOB 4 — archive_job ─────────────────────────────────────────────────
 
 resource "aws_glue_job" "archive" {
   name        = "${var.project_name}-archive"
@@ -190,9 +220,6 @@ resource "aws_glue_job" "archive" {
   number_of_workers = 2
   timeout           = 10
 
-  # REMOVED: execution_property { max_concurrent_runs = 1 }
-  # Now allows unlimited concurrent runs - Glue will queue automatically
-
   default_arguments = merge(local.glue_common_args, {
     "--raw_bucket"     = aws_s3_bucket.raw.id
     "--archive_bucket" = aws_s3_bucket.archive.id
@@ -204,15 +231,16 @@ resource "aws_glue_job" "archive" {
     Step     = "4-archive"
   }
 
-  depends_on = [aws_s3_object.script_archive]
+  depends_on = [aws_s3_object.script_archive, aws_s3_object.monitoring_lib]
 }
+
 
 # ── GLUE JOB 5 — kpi_aggregation_job (standalone) ────────────────────────────
 
 resource "aws_glue_job" "kpi_aggregation" {
   name        = "${var.project_name}-kpi-aggregation"
   role_arn    = aws_iam_role.glue_role.arn
-  description = "Reads silver/enriched_streams parquet and computes KPIs — run standalone after enrichment"
+  description = "Reads silver/enriched_streams and computes genre KPIs, top songs, and top genres"
 
   command {
     name            = "glueetl"
@@ -225,9 +253,6 @@ resource "aws_glue_job" "kpi_aggregation" {
   number_of_workers = 2
   timeout           = 30
 
-  # REMOVED: execution_property { max_concurrent_runs = 1 }
-  # Now allows unlimited concurrent runs - Glue will queue automatically
-
   default_arguments = merge(local.glue_common_args, {
     "--curated_bucket" = aws_s3_bucket.curated.id
   })
@@ -237,12 +262,12 @@ resource "aws_glue_job" "kpi_aggregation" {
     Step     = "standalone-kpi-aggregation"
   }
 
-  depends_on = [aws_s3_object.script_kpi_aggregation]
+  depends_on = [aws_s3_object.script_kpi_aggregation, aws_s3_object.monitoring_lib]
 }
 
 
 # ── GLUE WORKFLOW ─────────────────────────────────────────────────────────────
-# Chains jobs 1–4 in sequence. Each conditional trigger fires only when the
+# Chains jobs 1–5 in sequence. Each conditional trigger fires only when the
 # previous job SUCCEEDED, so a failure stops the whole pipeline.
 
 resource "aws_glue_workflow" "pipeline" {
@@ -255,8 +280,7 @@ resource "aws_glue_workflow" "pipeline" {
 }
 
 
-# Trigger 1 — starts the workflow on demand (call StartWorkflowRun in the console
-# or via AWS CLI to kick off a run)
+# Trigger 1 — starts the workflow on demand
 resource "aws_glue_trigger" "start" {
   name          = "${var.project_name}-start"
   type          = "ON_DEMAND"
@@ -347,3 +371,4 @@ resource "aws_glue_trigger" "after_dynamodb_loader" {
     job_name = aws_glue_job.archive.name
   }
 }
+

@@ -154,49 +154,76 @@ so the first notification already tells you what broke.
 
 ---
 
-## 5. How SNS Fits the Alerting Chain
+## 5. How the Alerting Chain Works — Two Parallel Paths
 
-Catching and logging a failure is useless if no human is told. **SNS** (Simple Notification Service)
-is the pub/sub hub that turns a caught failure into a notification.
+Catching and logging a failure is useless if no human is told. This pipeline uses **two independent
+alerting paths** that serve different purposes and complement each other.
 
-When any `Catch` routes to `NotifyFailure`, that state **publishes to the SNS topic**, formatting a
-human-readable message from the captured error ([step_functions.tf:426](../terraform/step_functions.tf#L426)):
+### Path 1 — SNS / CloudWatch (infrastructure-level, independent of the pipeline)
 
-```hcl
-NotifyFailure = {
-  Type     = "Task"
-  Resource = "arn:aws:states:::sns:publish"
-  Parameters = {
-    TopicArn    = aws_sns_topic.pipeline_alerts.arn
-    Subject     = "❌ Music Streaming Pipeline FAILED"
-    "Message.$" = "States.Format('PIPELINE FAILED\n\nError: {}\nCause: {}\n...console links...', $.error.Error, $.error.Cause)"
-  }
-  Next = "PipelineFailed"
-}
-```
+**SNS** (Simple Notification Service) is the pub/sub hub for infrastructure-level alerts. Both the
+state machine's `NotifyFailure` step *and* the independent CloudWatch alarms publish to the same
+`pipeline_alerts` SNS topic, which fans out to email and the AWS Chatbot Slack integration:
 
-`States.Format(...)` injects the actual error and cause, plus console links, into the message. After
-publishing, the execution ends at `PipelineFailed` (a `Fail` state) — so the run is correctly marked
-failed.
-
-The full alerting chain:
-
-```
+```text
  A step fails
    → Catch saves the error to $.error, routes to NotifyFailure
-     → NotifyFailure publishes to the SNS topic (pipeline_alerts)
-        ├─→ Email subscriber(s)                 (human-readable failure message)
-        └─→ AWS Chatbot → Slack channel          (if Slack is configured)
+     → NotifyFailure (SNS publish — human-readable failure message)
+        ├─→ Email subscriber(s)
+        └─→ AWS Chatbot → Slack channel
 ```
 
-SNS is the **single hub**: both the state machine *and* the independent CloudWatch alarms (Step
-Functions failures, DLQ depth, stuck queues, per-Glue-job task failures) publish to the same topic, so
-every alert path converges and you manage subscribers in one place. The CloudWatch alarms are
-deliberately **independent** of the state machine, so they catch failures that prevent the pipeline
-from even starting — belt-and-suspenders coverage (see [CloudWatch_Monitoring.md](CloudWatch_Monitoring.md)).
+Because the CloudWatch alarms are **independent of the state machine**, they catch failures that
+prevent the pipeline from even starting — a broken Pipe, a misconfigured IAM role, a stuck queue —
+scenarios that produce *no* Step Functions activity and would be invisible to a success-path-only
+design. SNS is the convergence point for all of these signals; you manage subscribers in one place.
 
-There is also a **success** notification: an EventBridge rule catches the state machine's `SUCCEEDED`
-event and posts a "✅ Pipeline SUCCEEDED" message, so silence never has to be interpreted as success.
+### Path 2 — Direct Slack webhook (in-flight, stage-level and pipeline-level)
+
+A second path operates entirely from inside the running pipeline and provides much richer, real-time
+visibility. It uses two components:
+
+- **`monitoring/pipeline_monitor.py` (`PipelineMonitor`)** — a Python context manager that wraps
+  every stage in every Glue job. It calls `SlackNotifier` on stage start, success, and failure as
+  the job runs, posting Block Kit messages directly to the Slack webhook URL.
+- **`lambda/pipeline_notifier.py`** — a Lambda function invoked by three dedicated Step Functions
+  states to post pipeline-level Block Kit messages: one at the start, one on success, and one on
+  failure (chained after the SNS step).
+
+The full in-flight notification sequence for a successful run looks like:
+
+```text
+[Step Functions] NotifyPipelineStarted Lambda  →  :rocket: Pipeline — Started
+[Glue] Validation job stage starts             →  :hourglass: Validation — In Progress
+[Glue] Validation job stage ends               →  :white_check_mark: Validation — Succeeded
+[Glue] ETL Transform stages start/end          →  (same pattern for each stage)
+   ... (each Glue job posts its own stage messages as it runs)
+[Step Functions] NotifyPipelineSucceeded Lambda →  :large_green_circle: Pipeline — Succeeded
+```
+
+On failure, the Step Functions failure path chains both notifications before terminating:
+
+```text
+ A step fails → Catch → NotifyFailure (SNS)
+                            → NotifySlackPipelineFailed (Lambda → rich Block Kit Slack)
+                                → PipelineFailed (Fail state)
+```
+
+Both notification states catch their own errors and route forward — a Slack delivery failure can
+never block the execution from reaching its terminal state.
+
+### Why both paths?
+
+| Concern | SNS / CloudWatch path | Direct webhook path |
+|---|---|---|
+| **What it catches** | Pipeline-start failures, broken Pipes, IAM errors, stuck queues | In-flight stage progress and pipeline start/end |
+| **When it fires** | When a metric threshold is crossed (asynchronous, minute-level granularity) | In real time, as each stage starts and completes |
+| **Format** | Plain-text SNS/email or Chatbot-formatted message | Rich Slack Block Kit — colour, bold headers, fields |
+| **Independence** | Completely independent of the state machine | Requires the webhook URL to be set (`SLACK_APP_WEBHOOK_URL`) |
+
+Together they ensure: if the pipeline never starts, the CloudWatch path fires; if the pipeline runs
+but a stage fails mid-way, both paths report it — the Lambda for Slack richness, the SNS for
+email/Chatbot redundancy.
 
 ---
 
@@ -208,11 +235,13 @@ Trace a transient crawler delay and a genuine bad-data failure through all three
 40s) → table appears on attempt 2 → success. No alert, no human involvement. *The pipeline healed
 itself.*
 
-**Genuine (missing column):** validation finds `streams` is missing `track_id` → raises `ValueError`
-→ Glue job fails → Step Functions **Catch** saves the error and routes to `NotifyFailure` →
-**SNS** publishes "❌ FAILED — streams missing track_id" to Slack/email → execution ends at
-`PipelineFailed`; **transform/aggregate/load never run** → logs in `/aws/glue/<project>` hold the full
-detail. *The failure was contained and announced; no bad data was served.*
+**Genuine (missing column):** validation's stage context manager catches the `ValueError` → calls
+`SlackNotifier.sendJobFailed` (direct webhook: ":red_circle: Validation — Failed") → re-raises →
+Glue job exits → Step Functions **Catch** saves the error and routes to `NotifyFailure` → **SNS**
+publishes "❌ FAILED" to email/Chatbot → `NotifySlackPipelineFailed` Lambda posts ":red_circle:
+Pipeline — FAILED" with the failed step name and error cause → execution ends at `PipelineFailed`;
+**transform/aggregate/load never run** → logs in `/aws/glue/<project>` hold the full detail. *The
+failure was contained, announced on two channels, and no bad data was served.*
 
 ---
 
@@ -223,8 +252,9 @@ detail. *The failure was contained and announced; no bad data was served.*
 | **Retry** | Exponential backoff (10/20/40s) in the validation job; the SFN crawler polling loop | Auto-heal transient failures without human involvement |
 | **Catch** | `Catch` on every SFN task → save `$.error` → `NotifyFailure` (specific catches & non-fatal steps too) | Contain failures; stop downstream steps from running on bad data |
 | **Log** | `/aws/glue/<project>` (driver/executor/insights) + `/aws/states/<project>` (transitions, execution data, X-Ray) | Capture the evidence to diagnose root cause |
-| **Alert** | `NotifyFailure` → SNS topic → email + Slack; independent CloudWatch alarms also publish to SNS | Make every failure visible to a human, with the error embedded |
+| **Alert (SNS path)** | `NotifyFailure` → SNS → email + Chatbot/Slack; independent CloudWatch alarms also publish to SNS | Infrastructure-level coverage; catches failures the pipeline itself can't see |
+| **Alert (webhook path)** | `PipelineMonitor` stage hooks + `NotifyPipelineStarted/Succeeded/Failed` Lambda states | Real-time, stage-granular Block Kit messages directly in Slack |
 
 The pattern is: **retry what might be transient, catch what truly failed, log everything, and
-announce it through SNS.** Together these turn an inevitable failure into a self-healed blip or a
-contained, clearly-explained alert — never silent corruption.
+announce it on two independent channels.** Together these turn an inevitable failure into a
+self-healed blip or a contained, clearly-explained alert — never silent corruption.

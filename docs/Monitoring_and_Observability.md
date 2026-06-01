@@ -17,10 +17,10 @@ These three words are used interchangeably in casual talk, but they are distinct
 pipeline needs all three. The clearest way to see the difference is by the question each answers:
 
 | Layer | Question it answers | Form | In this pipeline |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Logging** | *"What exactly happened, step by step?"* | Timestamped text lines | Glue job logs, Step Functions execution logs |
 | **Monitoring** | *"How is the system behaving over time — numbers, trends?"* | Numeric metrics / time series | Job failures, queue depth, message age, durations |
-| **Alerting** | *"Is something wrong right now that needs a human?"* | A notification triggered by a rule | CloudWatch alarms → SNS → Slack/email |
+| **Alerting** | *"Is something wrong right now that needs a human?"* | A notification triggered by a rule | CloudWatch alarms → SNS → Slack/email + direct webhook |
 
 The relationship between them:
 
@@ -99,29 +99,53 @@ deliberately focused on the signals that mean "act now."
 
 ---
 
-## 4. Alerting — How a Number Becomes a Notification
+## 4. Alerting — Two Independent Channels
+
+This pipeline uses two independent alerting paths that complement each other. Understanding both is
+important because they serve different scopes and fire at different granularities.
+
+### Channel 1 — CloudWatch alarms → SNS → email + Chatbot
 
 An **alarm** watches one metric against a threshold and changes state to `ALARM` when breached. This
 pipeline's alarms all publish to one **SNS topic** (`pipeline_alerts`), which fans out to **email** and
 **Slack** (via AWS Chatbot). The chain:
 
-```
- metric crosses threshold → CloudWatch alarm → SNS topic → ├─ Slack channel
+```text
+ metric crosses threshold → CloudWatch alarm → SNS topic → ├─ Slack (AWS Chatbot)
                                                             └─ Email
 ```
 
-Two design choices make the alerting trustworthy (see [CloudWatch_Monitoring.md](CloudWatch_Monitoring.md)
-and [Error_Handling_and_Retry.md](Error_Handling_and_Retry.md)):
+Two design choices make this path trustworthy (see [CloudWatch_Monitoring.md](CloudWatch_Monitoring.md)):
 
-- **Alarms are independent of the pipeline's own success path.** They catch failures that stop the
-  pipeline from even starting (broken Pipe, IAM misconfig, stuck queue) — failures that would produce
-  *no* Step Functions activity and so be invisible to a success-path-only design.
-- **Alerts are human-readable.** An EventBridge rule reshapes raw alarm payloads into plain-language
-  emails ("what fired, why, when, where to look"), and the failure notification embeds the actual
-  error and cause.
+- **Independent of the pipeline's own success path.** These alarms catch failures that stop the
+  pipeline from even starting — a broken Pipe, an IAM misconfiguration, a stuck queue — failures that
+  produce *no* Step Functions activity and would be invisible to an in-process alerting scheme.
+- **Human-readable.** An EventBridge rule reshapes raw alarm payloads into plain-language emails
+  ("what fired, why, when, where to look"), and the failure notification embeds the actual error.
 
-There's also a **positive** signal: an EventBridge rule posts "✅ Pipeline SUCCEEDED — all KPIs
-computed and loaded" on success, so silence is never ambiguously interpreted as success.
+### Channel 2 — Direct Slack webhook (in-flight, stage-granular)
+
+A second path operates from inside the running pipeline using two components:
+
+- **`monitoring/` package (`PipelineMonitor` + `SlackNotifier`)** — every Glue job wraps each of
+  its stages in a `PipelineMonitor.stage()` context manager. This calls the `SlackNotifier` on start,
+  success, and failure as the stage runs, posting rich Slack Block Kit messages directly to the
+  webhook URL. This is the source of the per-stage visibility inside each job.
+- **`lambda/pipeline_notifier.py`** — a Lambda function invoked by three dedicated Step Functions
+  states (`NotifyPipelineStarted`, `NotifyPipelineSucceeded`, `NotifySlackPipelineFailed`) to post
+  pipeline-level Block Kit messages at the very start and end of each run.
+
+```text
+ Pipeline starts      → NotifyPipelineStarted Lambda  →  :rocket: Pipeline — Started (Slack)
+ Glue stage starts    → PipelineMonitor hook           →  :hourglass: Job — In Progress (Slack)
+ Glue stage ends      → PipelineMonitor hook           →  :white_check_mark: Job — Succeeded (Slack)
+ Pipeline succeeds    → NotifyPipelineSucceeded Lambda →  :large_green_circle: Pipeline — Succeeded (Slack)
+ Pipeline fails       → NotifyFailure (SNS) + NotifySlackPipelineFailed Lambda → both channels fire
+```
+
+Unlike the CloudWatch path (which fires *after* a metric threshold is crossed), this path fires
+*in real time* as each stage begins and ends — so you see the pipeline progress live, not just the
+outcome.
 
 ---
 
@@ -130,15 +154,18 @@ computed and loaded" on success, so silence is never ambiguously interpreted as 
 This is the real test of observability: can you trust the system is fine **without** logging in to
 check? For this pipeline, **yes** — health is *pushed to you*, not something you have to *pull*:
 
-### Healthy looks like:
+### Healthy looks like
 
-1. **A "✅ Pipeline SUCCEEDED" message** arrives (Slack/email) after each run, confirming KPIs were
-   computed and loaded. Positive confirmation — not just absence of bad news.
-2. **No failure alerts.** Because alarms cover every failure mode (run failed, run timed out, DLQ
-   non-empty, queue backed up, any Glue job failed), *the absence of an alert is meaningful* — it means
-   none of those thresholds were crossed.
-3. **The DLQ is empty and the main queue drains.** No "DLQ has messages" or "messages stuck" alert
-   means events are flowing through the trigger chain normally.
+1. **A `:rocket: Pipeline — Started` message** arrives in Slack at the beginning of each run, posted
+   by the `NotifyPipelineStarted` Lambda, confirming the execution is in flight.
+2. **Stage-by-stage progress messages** arrive as each Glue job runs — `:hourglass:` when a stage
+   starts, `:white_check_mark:` when it completes — posted directly from the `PipelineMonitor`
+   context manager inside each job.
+3. **A `:large_green_circle: Pipeline — Succeeded` message** arrives after `ArchiveFiles` completes,
+   posted by the `NotifyPipelineSucceeded` Lambda. Positive confirmation — not just absence of bad news.
+4. **No failure alerts on either channel.** Because CloudWatch alarms cover every infrastructure
+   failure mode (run failed, run timed out, DLQ non-empty, queue backed up, any Glue job failed),
+   *the absence of an alarm is meaningful* — none of those thresholds were crossed.
 
 ### The key principle: trustworthy silence
 
@@ -160,11 +187,12 @@ goal is that you shouldn't *need* to look unless an alert tells you to.
 ## 6. Summary
 
 | Layer | Purpose | This pipeline |
-|---|---|---|
+| --- | --- | --- |
 | **Logging** | The detailed "what happened" narrative | Glue logs + Step Functions execution logs (30-day retention) |
 | **Monitoring** | Numeric health signals over time | Failures/timeouts, per-job task failures, DLQ depth, queue age, durations, record counts |
-| **Alerting** | Notify a human when a threshold breaks | CloudWatch alarms → SNS → Slack + email; human-readable; independent of the success path |
-| **Health without the console** | Trustworthy silence + positive confirmation | "✅ SUCCEEDED" on success; no alert = healthy because every failure mode is alarmed |
+| **Alerting (CloudWatch path)** | Infrastructure-level: notify when a metric threshold breaks | CloudWatch alarms → SNS → Chatbot/Slack + email; independent of the state machine |
+| **Alerting (webhook path)** | In-flight: real-time stage and pipeline progress | `PipelineMonitor` stage hooks (all 5 jobs) + `NotifyPipelineStarted/Succeeded/Failed` Lambda |
+| **Health without the console** | Trustworthy silence + active confirmation | Live stage messages + `:large_green_circle:` on success; no CloudWatch alarm = healthy |
 
 Logging, monitoring, and alerting are three layers, not synonyms: logs explain *why*, metrics show
 *how it's trending*, and alarms decide *when to wake a human*. This pipeline wires all three so that

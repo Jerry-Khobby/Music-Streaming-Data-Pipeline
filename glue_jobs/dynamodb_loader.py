@@ -1,5 +1,4 @@
 import sys
-import logging
 from decimal import Decimal
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
@@ -7,8 +6,10 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 import boto3
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from monitoring import buildLogger, SlackNotifier, PipelineMonitor
+from monitoring.notifier import resolveWebhookUrl
+
+logger = buildLogger(__name__)
 
 GENRE_KPIS_TABLE = "genre_kpis"
 TOP_SONGS_TABLE  = "top_songs"
@@ -23,7 +24,7 @@ def toDecimal(value):
 
 def writePartitionToDynamo(rows, tableName, region):
     dynamodb = boto3.resource("dynamodb", region_name=region)
-    table = dynamodb.Table(tableName)
+    table    = dynamodb.Table(tableName)
     with table.batch_writer() as batch:
         for row in rows:
             batch.put_item(Item=row)
@@ -74,28 +75,38 @@ def loadToDynamo(df, tableName, region, itemBuilder):
             region,
         )
     df.foreachPartition(writePartition)
-    logger.info(f"Loaded data into DynamoDB table: {tableName}")
+    logger.info(f"'{tableName}' — all records written to DynamoDB successfully.")
 
 
 if __name__ == "__main__":
     args = getResolvedOptions(sys.argv, ["JOB_NAME", "curated_bucket", "aws_region"])
 
-    sc = SparkContext()
+    sc          = SparkContext()
     glueContext = GlueContext(sc)
-    spark = glueContext.spark_session
-    job = Job(glueContext)
+    spark       = glueContext.spark_session
+    job         = Job(glueContext)
     job.init(args["JOB_NAME"], args)
 
     goldBase = f"s3://{args['curated_bucket']}/gold"
     region   = args["aws_region"]
 
-    genreKpisDF = loadParquet(spark, f"{goldBase}/genre_kpis").dropDuplicates(["genre_date"])
-    topSongsDF  = loadParquet(spark, f"{goldBase}/top_songs").dropDuplicates(["genre_date", "rank"])
-    topGenresDF = loadParquet(spark, f"{goldBase}/top_genres").dropDuplicates(["date", "rank"])
+    webhookUrl = resolveWebhookUrl(sys.argv)
+    notifier   = SlackNotifier(webhookUrl) if webhookUrl else None
+    monitor    = PipelineMonitor(args["JOB_NAME"], notifier)
 
-    loadToDynamo(genreKpisDF, GENRE_KPIS_TABLE, region, buildGenreKpisItem)
-    loadToDynamo(topSongsDF,  TOP_SONGS_TABLE,  region, buildTopSongsItem)
-    loadToDynamo(topGenresDF, TOP_GENRES_TABLE, region, buildTopGenresItem)
+    with monitor.stage("Reading aggregated KPI data from the Gold layer"):
+        genreKpisDF = loadParquet(spark, f"{goldBase}/genre_kpis").dropDuplicates(["genre_date"])
+        topSongsDF  = loadParquet(spark, f"{goldBase}/top_songs").dropDuplicates(["genre_date", "rank"])
+        topGenresDF = loadParquet(spark, f"{goldBase}/top_genres").dropDuplicates(["date", "rank"])
 
-    logger.info("DynamoDB load complete.")
+    with monitor.stage("Writing genre KPIs to DynamoDB"):
+        loadToDynamo(genreKpisDF, GENRE_KPIS_TABLE, region, buildGenreKpisItem)
+
+    with monitor.stage("Writing top songs per genre to DynamoDB"):
+        loadToDynamo(topSongsDF, TOP_SONGS_TABLE, region, buildTopSongsItem)
+
+    with monitor.stage("Writing top genres per day to DynamoDB"):
+        loadToDynamo(topGenresDF, TOP_GENRES_TABLE, region, buildTopGenresItem)
+
+    monitor.logSummary()
     job.commit()

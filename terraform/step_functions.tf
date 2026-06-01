@@ -9,6 +9,7 @@
 #       WaitForCrawler       → waits 45 s between polls
 #       CheckCrawlerStatus   → reads crawler state via AWS SDK
 #       IsCrawlerReady       → loops back if still RUNNING, proceeds when READY
+#       CheckCatalogTables   → verifies streams table exists in Glue Catalog (EntityNotFoundException = clean exit)
 #       CheckStreamsExist     → inspects S3 for files under streams/ before running jobs
 #       AreThereStreams       → exits cleanly (Succeed) if no files found
 #    2. ValidateData         → validation_job        (fails fast if schema is wrong)
@@ -64,10 +65,26 @@ data "aws_iam_policy_document" "sfn_permissions" {
   }
 
   statement {
+    sid    = "GlueCatalogRead"
+    effect = "Allow"
+    actions = [
+      "glue:GetTable",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
     sid       = "SnsPublish"
     effect    = "Allow"
     actions   = ["sns:Publish"]
     resources = [aws_sns_topic.pipeline_alerts.arn]
+  }
+
+  statement {
+    sid     = "LambdaInvoke"
+    effect  = "Allow"
+    actions = ["lambda:InvokeFunction"]
+    resources = [aws_lambda_function.pipeline_notifier.arn]
   }
 
   statement {
@@ -215,10 +232,34 @@ locals {
           # so it is our turn to own the pipeline.
           Variable         = "$.concurrency.oldest.ExecutionArn"
           StringEqualsPath = "$$.Execution.Id"
-          Next             = "StartRawCrawler"
+          Next             = "NotifyPipelineStarted"
         }]
         # An older execution is still running — yield and re-check in 60 s.
         Default = "WaitForPreviousRun"
+      }
+
+      # ── PIPELINE-LEVEL SLACK NOTIFICATIONS ────────────────────────────────
+      # A Lambda function posts a rich Block Kit message for each pipeline event.
+      # All three states catch every error and route to the next pipeline state —
+      # a failed Slack notification must never block or fail the pipeline itself.
+
+      NotifyPipelineStarted = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.pipeline_notifier.arn
+          Payload = {
+            "event_type"     = "started"
+            "execution_id.$" = "$$.Execution.Id"
+          }
+        }
+        ResultPath = null
+        Next       = "StartRawCrawler"
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = null
+          Next        = "StartRawCrawler"
+        }]
       }
 
       WaitForPreviousRun = {
@@ -282,10 +323,47 @@ locals {
           {
             Variable     = "$.crawlerStatus.Crawler.State"
             StringEquals = "READY"
-            Next         = "CheckStreamsExist"
+            Next         = "CheckCatalogTables"
           }
         ]
         Default = "WaitForCrawler"
+      }
+
+      # ── CATALOG TABLE GUARD ────────────────────────────────────────────────
+      # The crawler reports READY after it finishes — but READY only means the
+      # crawler run completed, NOT that any tables were registered.  If the
+      # streams/ prefix was empty when the crawler ran (e.g. archive already
+      # moved everything out), the crawler exits READY without creating the
+      # streams table, and the validation job then crashes with EntityNotFound.
+      #
+      # This state performs a direct GetTable call against the Glue Data Catalog.
+      # If the table exists we continue to the S3 file count check.
+      # If it throws EntityNotFoundException the catalog has no streams table —
+      # treat that identically to "no files found" and exit cleanly.
+
+      CheckCatalogTables = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::aws-sdk:glue:getTable"
+        Parameters = {
+          DatabaseName = var.glue_database_name
+          Name         = "streams"
+        }
+        ResultPath = "$.catalogCheck"
+        Next       = "CheckStreamsExist"
+        Catch = [
+          {
+            # Crawler ran on an empty prefix — no streams table was registered.
+            # Nothing to process; exit cleanly without firing a failure alert.
+            ErrorEquals = ["Glue.EntityNotFoundException"]
+            ResultPath  = "$.error"
+            Next        = "NoStreamsToProcess"
+          },
+          {
+            ErrorEquals = ["States.ALL"]
+            ResultPath  = "$.error"
+            Next        = "NotifyFailure"
+          }
+        ]
       }
 
       # ── STREAMS EXISTENCE CHECK ────────────────────────────────────────────
@@ -443,11 +521,30 @@ locals {
           }
         }
         ResultPath = "$.archiveResult"
-        Next       = "PipelineSucceeded"
+        Next       = "NotifyPipelineSucceeded"
         Catch = [{
           ErrorEquals = ["States.ALL"]
           ResultPath  = "$.error"
           Next        = "NotifyFailure"
+        }]
+      }
+
+      NotifyPipelineSucceeded = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.pipeline_notifier.arn
+          Payload = {
+            "event_type"     = "succeeded"
+            "execution_id.$" = "$$.Execution.Id"
+          }
+        }
+        ResultPath = null
+        Next       = "PipelineSucceeded"
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = null
+          Next        = "PipelineSucceeded"
         }]
       }
 
@@ -462,7 +559,27 @@ locals {
           "Message.$" = "States.Format('PIPELINE FAILED\n\nError: {}\nCause: {}\n\nStep Functions console (click the red execution):\nhttps://us-east-1.console.aws.amazon.com/states/home?region=us-east-1#/statemachines\n\nGlue job run history (if a Glue job failed):\nhttps://us-east-1.console.aws.amazon.com/glue/home?region=us-east-1#/etl/jobs', $.error.Error, $.error.Cause)"
         }
         ResultPath = "$.snsResult"
+        Next       = "NotifySlackPipelineFailed"
+      }
+
+      NotifySlackPipelineFailed = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.pipeline_notifier.arn
+          Payload = {
+            "event_type"     = "failed"
+            "execution_id.$" = "$$.Execution.Id"
+            "error.$"        = "$.error"
+          }
+        }
+        ResultPath = null
         Next       = "PipelineFailed"
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = null
+          Next        = "PipelineFailed"
+        }]
       }
 
       PipelineFailed = {

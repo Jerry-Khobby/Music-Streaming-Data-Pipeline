@@ -41,15 +41,19 @@ story. Code references map to [glue_jobs/](../glue_jobs/) and [terraform/](../te
      ▼
  5. Step Functions orchestrates the rest ───────────────┐         ← AWS Step Functions
      │                                                   │
-     ├─ 5a. Run Glue crawler → register schema           │         ← Glue Crawler + Data Catalog
-     ├─ 5b. Validate (schema, non-empty, columns)        │         ← Glue Job: validation
-     ├─ 5c. Transform: join + dedup → Silver Parquet      │        ← Glue Job: etl_transform
-     ├─ 5d. Aggregate: compute KPIs → Gold Parquet        │        ← Glue Job: kpi_aggregation
-     ├─ 5e. Load Gold → DynamoDB items                    │        ← Glue Job: dynamodb_loader
-     ├─ 5f. Refresh Athena partitions (non-fatal)         │        ← Glue Crawler (curated)
-     └─ 5g. Archive processed raw file                    │        ← Glue Job: archive
+     ├─ 5a. NotifyPipelineStarted → Slack                │         ← Lambda (pipeline_notifier)
+     ├─ 5b. Run Glue crawler → register schema           │         ← Glue Crawler + Data Catalog
+     ├─ 5c. Validate → stage start/end alerts            │         ← Glue Job: validation + PipelineMonitor
+     ├─ 5d. Transform: join + dedup → Silver Parquet      │        ← Glue Job: etl_transform + PipelineMonitor
+     ├─ 5e. Aggregate: compute KPIs → Gold Parquet        │        ← Glue Job: kpi_aggregation + PipelineMonitor
+     ├─ 5f. Load Gold → DynamoDB items                    │        ← Glue Job: dynamodb_loader + PipelineMonitor
+     ├─ 5g. Refresh Athena partitions (non-fatal)         │        ← Glue Crawler (curated)
+     ├─ 5h. Archive processed raw file                    │        ← Glue Job: archive + PipelineMonitor
+     └─ 5i. NotifyPipelineSucceeded → Slack               │        ← Lambda (pipeline_notifier)
      ▼                                                   ▼
- 6. KPI is now queryable in DynamoDB and Athena      ✅ success alert (SNS → Slack/email)
+ 6. KPI is now queryable in DynamoDB and Athena
+     │
+     └─ Both channels confirm: :large_green_circle: Slack (Lambda webhook) + ✅ SNS/email/Chatbot
 ```
 
 Everything is encrypted at rest (AES256) and in transit (HTTPS) throughout (see
@@ -137,6 +141,16 @@ Our event is now inside a running **Step Functions execution**.
 The state machine is the conductor (see [Step_Functions.md](Step_Functions.md)). It first does some
 housekeeping our event passes through invisibly: it **normalizes the input** to a clean `{}`, and
 **checks no other run is active** (if one were, it would wait and retry). Then the real work begins.
+
+Once this execution is confirmed as the oldest running (i.e., it owns the pipeline), the state
+machine immediately invokes the **`pipeline_notifier` Lambda**, which posts a `:rocket: Pipeline —
+Started` Block Kit message to Slack — confirming the run is in flight before any Glue job has been
+launched (see [Lambda_Pipeline_Notifier.md](Lambda_Pipeline_Notifier.md)).
+
+Within each Glue job, the **`PipelineMonitor`** context manager wraps every named stage. It calls
+`SlackNotifier` on stage start and again on stage success or failure, so the Slack channel receives
+a live `:hourglass:` → `:white_check_mark:` (or `:red_circle:`) pair for each stage as the job
+runs.
 
 ### Step 5a — Crawler registers the schema
 
@@ -226,11 +240,19 @@ housekeeping our event passes through invisibly: it **normalizes the input** to 
 
 ## 8. Step 6 — The Result Is Live (and the Run Is Announced)
 
-The execution reaches its `Succeed` state. An EventBridge rule catches the `SUCCEEDED` event and posts
-a **"✅ Pipeline SUCCEEDED — all KPIs computed and loaded"** message to Slack/email (see
-[Monitoring_and_Observability.md](Monitoring_and_Observability.md)). Throughout, every step logged to
-CloudWatch; had anything failed, a `Catch` would have routed to an SNS failure alert and stopped the
-run (see [Error_Handling_and_Retry.md](Error_Handling_and_Retry.md)).
+Before the execution reaches its terminal `Succeed` state, the state machine invokes the
+**`pipeline_notifier` Lambda** one final time (`NotifyPipelineSucceeded`), which posts a
+`:large_green_circle: Pipeline — Succeeded` Block Kit message to Slack. Separately, an EventBridge
+rule catches the `SUCCEEDED` event on the Step Functions execution and posts a "✅ Pipeline
+SUCCEEDED" message via SNS → Chatbot (see [Monitoring_and_Observability.md](Monitoring_and_Observability.md)).
+Both notifications are independent; both confirm the same run completed.
+
+Throughout the run, every state transition was logged to CloudWatch at `level = ALL`, and an X-Ray
+trace captured timing across all states. Had anything failed, the `Catch` block on the failing step
+would have routed to `NotifyFailure` (SNS → email/Chatbot) and then to `NotifySlackPipelineFailed`
+(Lambda → rich Slack Block Kit with the failed step name and error cause), before ending at
+`PipelineFailed` — the run clearly marked failed on both channels (see
+[Error_Handling_and_Retry.md](Error_Handling_and_Retry.md)).
 
 Our user's tap is now reflected in:
 
@@ -243,34 +265,40 @@ Our user's tap is now reflected in:
 ## 9. The Complete Service + Transformation Table
 
 | Step | Service | What it does to our event | Data shape |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Born | App → **Firehose** | Records `user_id, track_id, listen_time`; Firehose batches into a JSON file | A JSON record |
 | 1 | **Amazon S3** (Bronze) | Stores the raw JSON file immutably, encrypted | Raw JSON record |
 | 2 | **EventBridge** | Detects & filters the `streams/` upload, routes it | (event, not data) |
 | 3 | **SQS** | Buffers the event durably (DLQ as safety net) | (message) |
 | 4 | **EventBridge Pipes** | Reshapes envelope, starts the state machine | (clean input) |
-| 5 | **Step Functions** | Orchestrates all steps below, with error handling | — |
-| 5a | **Glue Crawler + Catalog** | Registers schema so jobs can read the file | schema known |
-| 5b | **Glue: validation** | Gate — confirms schema/non-empty/columns | unchanged (pass/fail) |
-| 5c | **Glue: etl_transform** | **Joins to song → enriched; derives date; dedupes** → Silver Parquet | enriched, typed row |
-| 5d | **Glue: kpi_aggregation** | **Aggregates into genre/day KPIs & rankings** → Gold Parquet | a statistic (counted/summed) |
-| 5e | **Glue: dynamodb_loader** | Upserts Gold rows as DynamoDB items (typed, key-deduped) | DynamoDB item |
-| 5f | **Glue Crawler (curated)** | Registers Gold partition for Athena | (metadata) |
-| 5g | **Glue: archive** | Moves the raw file to the archive bucket | raw file relocated |
-| 6 | **SNS / EventBridge** | Announces success (or failure) to Slack/email | (notification) |
+| 5 | **Step Functions** | Orchestrates all steps below, with error handling and notifications | — |
+| 5a | **Lambda** (NotifyPipelineStarted) | Posts `:rocket: Pipeline — Started` to Slack | (notification) |
+| 5b | **Glue Crawler + Catalog** | Registers schema so jobs can read the file | schema known |
+| 5c | **Glue: validation** + PipelineMonitor | Gate — confirms schema/non-empty/columns; posts stage alerts | unchanged (pass/fail) |
+| 5d | **Glue: etl_transform** + PipelineMonitor | **Joins to song → enriched; derives date; dedupes** → Silver Parquet; posts stage alerts | enriched, typed row |
+| 5e | **Glue: kpi_aggregation** + PipelineMonitor | **Aggregates into genre/day KPIs & rankings** → Gold Parquet; posts stage alerts | a statistic (counted/summed) |
+| 5f | **Glue: dynamodb_loader** + PipelineMonitor | Upserts Gold rows as DynamoDB items (typed, key-deduped); posts stage alerts | DynamoDB item |
+| 5g | **Glue Crawler (curated)** | Registers Gold partition for Athena | (metadata) |
+| 5h | **Glue: archive** + PipelineMonitor | Moves the raw file to the archive bucket; posts stage alert | raw file relocated |
+| 5i | **Lambda** (NotifyPipelineSucceeded) | Posts `:large_green_circle: Pipeline — Succeeded` to Slack | (notification) |
+| 6 | **SNS / EventBridge** | Announces success (or failure) to Slack via Chatbot + email | (notification) |
 
 ---
 
 ## 10. Summary
 
 A single tap on a phone is sent to **Kinesis Data Firehose**, which batches it into a JSON file that
-lands in **S3**, is detected by **EventBridge**, buffered in
-**SQS**, and handed by **Pipes** to **Step Functions**, which drives **Glue** through schema discovery,
-validation, enrichment (join + dedup → Silver), aggregation (→ Gold KPIs), and loading into
-**DynamoDB**, then refreshes **Athena** partitions and archives the source file — finishing with a
-success alert via **SNS**.
+lands in **S3**, is detected by **EventBridge**, buffered in **SQS**, and handed by **Pipes** to
+**Step Functions**. Step Functions immediately announces the run has started via the
+**`pipeline_notifier` Lambda** → Slack, then drives **Glue** through schema discovery, validation,
+enrichment (join + dedup → Silver), aggregation (→ Gold KPIs), and loading into **DynamoDB** — with
+each stage posting a live start/success/fail message to Slack via the **`PipelineMonitor`** hooks.
+The pipeline then refreshes **Athena** partitions, archives the source file, and announces success
+on two independent channels: the **Lambda** posts a rich Block Kit message directly to the Slack
+webhook, and **SNS** posts via **Chatbot** to Slack and by email.
 
 Along the way the event is transformed from *three raw facts* → *an enriched, typed record* → *a
-contribution to daily genre statistics* → *a servable KPI item*. That is the whole pipeline in one
-event's journey: **twelve services, one directional flow from raw tap to live metric, each step
-preserved, validated, idempotent, encrypted, and observable.**
+contribution to daily genre statistics* → *a servable KPI item*, with every stage of that journey
+broadcast in real time to Slack. That is the whole pipeline in one event's journey: **thirteen
+services, one directional flow from raw tap to live metric, each step preserved, validated,
+idempotent, encrypted, observable, and announced.**

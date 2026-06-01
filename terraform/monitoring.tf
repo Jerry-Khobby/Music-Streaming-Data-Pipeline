@@ -319,3 +319,9 @@ output "email_alerts_status" {
   description = "Whether email alerts are wired up — recipient must click the confirmation link in their inbox before alerts start flowing"
   value       = var.alert_email == "" ? "Disabled — set alert_email to enable" : "Subscribed ${var.alert_email} (confirm via the link sent to that inbox)"
 }
+
+output "webhook_alerts_status" {
+  description = "Whether direct Slack webhook alerts are enabled for Glue job failures"
+  value       = nonsensitive(var.slack_webhook_url) != "" ? "Enabled — Glue jobs post failure alerts directly to Slack via webhook" : "Disabled — set slack_webhook_url in terraform.tfvars to enable"
+}
+

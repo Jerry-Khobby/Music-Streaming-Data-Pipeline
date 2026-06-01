@@ -1,5 +1,4 @@
 import sys
-import logging
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
@@ -7,8 +6,10 @@ from awsglue.job import Job
 from pyspark.sql import DataFrame, functions as F
 from pyspark.sql.window import Window
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from monitoring import buildLogger, SlackNotifier, PipelineMonitor
+from monitoring.notifier import resolveWebhookUrl
+
+logger = buildLogger(__name__)
 
 TOP_SONGS_RANK  = 3
 TOP_GENRES_RANK = 5
@@ -16,7 +17,7 @@ TOP_GENRES_RANK = 5
 
 def loadParquet(spark, path) -> DataFrame:
     df = spark.read.parquet(path)
-    logger.info(f"Loaded {df.count()} rows from {path}")
+    logger.info(f"Loaded {df.count():,} rows from {path}")
     return df
 
 
@@ -48,9 +49,9 @@ def computeListeningTime(enrichedDF) -> DataFrame:
 
 
 def assembleGenreKpis(enrichedDF) -> DataFrame:
-    listenCountDF    = computeListenCount(enrichedDF)
+    listenCountDF     = computeListenCount(enrichedDF)
     uniqueListenersDF = computeUniqueListeners(enrichedDF)
-    listeningTimeDF  = computeListeningTime(enrichedDF)
+    listeningTimeDF   = computeListeningTime(enrichedDF)
 
     return (
         listenCountDF
@@ -96,15 +97,15 @@ def writeParquet(df, path, partitionCols=None):
     if partitionCols:
         writer = writer.partitionBy(*partitionCols)
     writer.save(path)
-    logger.info(f"Written to {path}")
+    logger.info(f"Results saved to {path}")
 
 
 if __name__ == "__main__":
     args = getResolvedOptions(sys.argv, ["JOB_NAME", "curated_bucket"])
 
-    sc = SparkContext()
+    sc          = SparkContext()
     glueContext = GlueContext(sc)
-    spark = glueContext.spark_session
+    spark       = glueContext.spark_session
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
     job = Job(glueContext)
     job.init(args["JOB_NAME"], args)
@@ -112,17 +113,28 @@ if __name__ == "__main__":
     silverBase = f"s3://{args['curated_bucket']}/silver"
     goldBase   = f"s3://{args['curated_bucket']}/gold"
 
-    enrichedDF = loadParquet(spark, f"{silverBase}/enriched_streams")
-    enrichedDF.cache()
+    webhookUrl = resolveWebhookUrl(sys.argv)
+    notifier   = SlackNotifier(webhookUrl) if webhookUrl else None
+    monitor    = PipelineMonitor(args["JOB_NAME"], notifier)
 
-    genreKpisDF = assembleGenreKpis(enrichedDF)
-    topSongsDF  = computeTopSongsPerGenre(enrichedDF)
-    topGenresDF = computeTopGenresPerDay(genreKpisDF)
+    with monitor.stage("Loading enriched stream data from the Silver layer"):
+        enrichedDF = loadParquet(spark, f"{silverBase}/enriched_streams")
+        enrichedDF.cache()
 
-    writeParquet(genreKpisDF, f"{goldBase}/genre_kpis", partitionCols=["stream_date"])
-    writeParquet(topSongsDF,  f"{goldBase}/top_songs",  partitionCols=["stream_date"])
-    writeParquet(topGenresDF, f"{goldBase}/top_genres",  partitionCols=["date"])
+    with monitor.stage("Computing genre-level KPIs"):
+        genreKpisDF = assembleGenreKpis(enrichedDF)
+
+    with monitor.stage("Ranking the top songs per genre"):
+        topSongsDF = computeTopSongsPerGenre(enrichedDF)
+
+    with monitor.stage("Ranking the top genres per day"):
+        topGenresDF = computeTopGenresPerDay(genreKpisDF)
+
+    with monitor.stage("Writing KPI results to the Gold layer in S3"):
+        writeParquet(genreKpisDF, f"{goldBase}/genre_kpis", partitionCols=["stream_date"])
+        writeParquet(topSongsDF,  f"{goldBase}/top_songs",  partitionCols=["stream_date"])
+        writeParquet(topGenresDF, f"{goldBase}/top_genres",  partitionCols=["date"])
 
     enrichedDF.unpersist()
-    logger.info("KPI aggregation complete.")
+    monitor.logSummary()
     job.commit()
