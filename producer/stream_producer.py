@@ -144,13 +144,13 @@ def parse_args():
     parser.add_argument(
         "--min-delay",
         type=float,
-        default=400,
+        default=300,
         help="Minimum seconds to wait between files (must exceed 60 so files land separately)",
     )
     parser.add_argument(
         "--max-delay",
         type=float,
-        default=400,
+        default=360,
         help="Maximum seconds to wait between files",
     )
     parser.add_argument(
