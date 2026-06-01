@@ -312,7 +312,7 @@ locals {
         Parameters = {
           Bucket  = "${var.raw_bucket_name}-${var.environment}"
           Prefix  = "streams/"
-          MaxKeys = 1
+          MaxKeys = 1000
         }
         ResultPath = "$.streamsCheck"
         Next       = "AreThereStreams"
@@ -434,6 +434,13 @@ locals {
         Resource = "arn:aws:states:::glue:startJobRun.sync"
         Parameters = {
           JobName = aws_glue_job.archive.name
+          Arguments = {
+            "--raw_bucket"     = "${var.raw_bucket_name}-${var.environment}"
+            "--archive_bucket" = "${var.archive_bucket_name}-${var.environment}"
+            "--aws_region"     = var.aws_region
+            # Pass ONLY the keys that were present when this execution started
+            "--processed_keys.$" = "States.JsonToString($.streamsCheck.Contents[*].Key)"
+          }
         }
         ResultPath = "$.archiveResult"
         Next       = "PipelineSucceeded"

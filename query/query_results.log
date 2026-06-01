@@ -1,0 +1,33 @@
+Found credentials in shared credentials file: ~/.aws/credentials
+
+========== SCANNING GENRE KPIs (first 5 items) ==========
+{'genre_date': 'bluegrass#2024-06-25', 'listen_count': Decimal('344'), 'unique_listeners': Decimal('338'), 'track_genre': 'bluegrass', 'total_listen_time_ms': Decimal('74103028'), 'stream_date': '2024-06-25', 'avg_listen_time_ms_per_user': Decimal('219239.7278106509')}
+{'genre_date': 'electronic#2024-06-25', 'listen_count': Decimal('323'), 'unique_listeners': Decimal('320'), 'track_genre': 'electronic', 'total_listen_time_ms': Decimal('73545587'), 'stream_date': '2024-06-25', 'avg_listen_time_ms_per_user': Decimal('229829.959375')}
+{'genre_date': 'rock-n-roll#2024-06-25', 'listen_count': Decimal('299'), 'unique_listeners': Decimal('297'), 'track_genre': 'rock-n-roll', 'total_listen_time_ms': Decimal('53027112'), 'stream_date': '2024-06-25', 'avg_listen_time_ms_per_user': Decimal('178542.46464646465')}
+{'genre_date': 'malay#2024-06-25', 'listen_count': Decimal('392'), 'unique_listeners': Decimal('391'), 'track_genre': 'malay', 'total_listen_time_ms': Decimal('97514707'), 'stream_date': '2024-06-25', 'avg_listen_time_ms_per_user': Decimal('249398.22762148338')}
+{'genre_date': 'guitar#2024-06-25', 'listen_count': Decimal('332'), 'unique_listeners': Decimal('329'), 'track_genre': 'guitar', 'total_listen_time_ms': Decimal('77063596'), 'stream_date': '2024-06-25', 'avg_listen_time_ms_per_user': Decimal('234235.85410334347')}
+
+========== GENRE KPIs — specific genre ==========
+Genre:                  bluegrass
+Date:                   2024-06-25
+Listen Count:           344
+Unique Listeners:       338
+Total Listen Time (ms): 74103028
+Avg Listen Time (ms):   219239.7278106509
+
+========== TOP 3 SONGS — specific genre ==========
+  Rank 1: Long Journey Home | plays: 4
+  Rank 2: The Great Divide | plays: 3
+  Rank 3: Texas | plays: 3
+
+========== TOP 5 GENRES ==========
+  Rank 1: children — 418 listens
+  Rank 2: anime — 415 listens
+  Rank 3: disney — 413 listens
+  Rank 4: cantopop — 407 listens
+  Rank 5: happy — 395 listens
+
+========== TABLE ROW COUNTS ==========
+  genre_kpis: 113 items
+  top_songs: 339 items
+  top_genres: 5 items
