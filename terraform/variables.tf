@@ -38,9 +38,14 @@ variable "archive_bucket_name" {
 
 # ── Ingestion / Firehose ─────────────────────────────────────────────────────
 # These two thresholds control how often Firehose lands a batch file in S3 (it
-# flushes when EITHER trips first). Defaults consolidate a short burst into one
-# file while still flushing sparse data within ~5 minutes. Lower the interval for
-# faster latency at the cost of more, smaller files (and more pipeline runs).
+# flushes when EITHER trips first):
+#   • interval = 60 s  → the AWS minimum, so small/sparse data lands as fast as
+#     Firehose allows (60 s is a hard floor — Firehose cannot deliver instantly).
+#   • size     = 5 MB  → a genuine high-volume burst still consolidates into one
+#     file by size before the 60 s timer, avoiding a flood of tiny files.
+# This pairing gives the most demo-responsive delivery Firehose supports while
+# keeping burst consolidation. Raise the interval (toward 900) for fewer, larger
+# files and fewer pipeline runs if latency stops mattering.
 
 variable "firehose_buffer_size_mb" {
   description = "Firehose buffer size in MB before flushing to S3 (1–128)"
@@ -54,9 +59,9 @@ variable "firehose_buffer_size_mb" {
 }
 
 variable "firehose_buffer_interval_seconds" {
-  description = "Max seconds Firehose buffers records before flushing to S3 (60–900)"
+  description = "Max seconds Firehose buffers records before flushing to S3 (60 = AWS minimum, up to 900)"
   type        = number
-  default     = 300
+  default     = 60
 
   validation {
     condition     = var.firehose_buffer_interval_seconds >= 60 && var.firehose_buffer_interval_seconds <= 900

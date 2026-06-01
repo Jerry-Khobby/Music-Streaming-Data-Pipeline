@@ -158,15 +158,23 @@ locals {
       # Each Glue job allows concurrent runs, but running two full pipelines at
       # the same time wastes DPU hours and can cause data races in silver/gold.
       #
-      # Instead of aborting, we poll until the earlier execution finishes,
+      # Instead of aborting, we poll until every earlier execution finishes,
       # then proceed normally — all uploaded files are picked up in one run.
       #
-      # How it works:
-      #   ListExecutions returns up to 2 RUNNING executions (MaxResults = 2).
-      #   If Executions[1] is present, at least 2 executions are running — we
-      #   are the newer one, so we wait 60 s and check again.
-      #   Once the previous run finishes, Executions[1] disappears and we
-      #   fall through to StartRawCrawler.
+      # How it works (oldest-wins serialization):
+      #   ListExecutions returns RUNNING executions newest-first, so the OLDEST
+      #   still-running execution is always the LAST element. FindOldestRunning
+      #   extracts that element's ARN and IsAnotherRunning compares it to our
+      #   own execution ARN ($$.Execution.Id):
+      #     • oldest == me  → no earlier run is in flight → proceed.
+      #     • oldest != me  → an older run owns the pipeline → wait 60 s, recheck.
+      #   Exactly one execution (the oldest) proceeds at a time; as each finishes
+      #   the next-oldest becomes the last element and takes its turn.
+      #
+      #   Why not "wait if Executions[1] exists"?  That deadlocks: when several
+      #   executions all sit in the wait loop, each sees the others as RUNNING
+      #   and none can tell it is the one that should go.  Comparing against the
+      #   oldest ARN breaks the symmetry so the queue actually drains.
 
       CheckAlreadyRunning = {
         Type     = "Task"
@@ -174,10 +182,13 @@ locals {
         Parameters = {
           StateMachineArn = "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:stateMachine:${var.project_name}-pipeline"
           StatusFilter    = "RUNNING"
-          MaxResults      = 2
+          # Fetch a generous window so the genuinely oldest run is always in the
+          # result set even during an upload burst (well under the 256 KB state
+          # limit — ~100 entries is tens of KB).
+          MaxResults = 100
         }
         ResultPath = "$.runningCheck"
-        Next       = "IsAnotherRunning"
+        Next       = "FindOldestRunning"
         Catch = [{
           ErrorEquals = ["States.ALL"]
           ResultPath  = "$.error"
@@ -185,17 +196,29 @@ locals {
         }]
       }
 
+      # The oldest still-running execution is the last element of the
+      # newest-first list.  Pull its ARN out so the Choice below can compare it
+      # against our own execution ARN.
+      FindOldestRunning = {
+        Type = "Pass"
+        Parameters = {
+          "oldest.$" = "States.ArrayGetItem($.runningCheck.Executions, States.MathAdd(States.ArrayLength($.runningCheck.Executions), -1))"
+        }
+        ResultPath = "$.concurrency"
+        Next       = "IsAnotherRunning"
+      }
+
       IsAnotherRunning = {
         Type = "Choice"
         Choices = [{
-          # Executions[1] existing means 2+ executions are running — we are the
-          # newer one, so yield and wait for the previous run to finish.
-          Variable  = "$.runningCheck.Executions[1]"
-          IsPresent = true
-          Next      = "WaitForPreviousRun"
+          # The oldest running execution is us — no earlier run is in flight,
+          # so it is our turn to own the pipeline.
+          Variable         = "$.concurrency.oldest.ExecutionArn"
+          StringEqualsPath = "$$.Execution.Id"
+          Next             = "StartRawCrawler"
         }]
-        # Only one execution running (us) — safe to proceed.
-        Default = "StartRawCrawler"
+        # An older execution is still running — yield and re-check in 60 s.
+        Default = "WaitForPreviousRun"
       }
 
       WaitForPreviousRun = {

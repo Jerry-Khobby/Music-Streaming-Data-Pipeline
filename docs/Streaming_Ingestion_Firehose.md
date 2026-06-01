@@ -66,8 +66,8 @@ here; Firehose absorbs the spike on its own (its Direct PUT quotas are far above
 ### Sparse — "data uploaded just twice a day"
 
 Firehose flushes on a buffer **size** *or* an **interval**, whichever comes first. So even when only
-a handful of records arrive at noon, the interval timer (max 15 minutes, default 5 here) forces a
-flush and the file lands promptly. And because Firehose Direct PUT bills **per GB ingested**, a quiet
+a handful of records arrive at noon, the interval timer (set to **60 s** here, the AWS minimum)
+forces a flush and the file lands promptly. And because Firehose Direct PUT bills **per GB ingested**, a quiet
 day costs almost nothing. KDS would be the *wrong* choice here: it bills per **shard-hour** whether
 data flows or not, so you would pay for mostly-idle shards on every quiet day.
 
@@ -119,7 +119,7 @@ resource "aws_kinesis_firehose_delivery_stream" "streams_ingestion" {
     error_output_prefix = "streams-errors/!{firehose:error-output-type}/"
 
     buffering_size     = var.firehose_buffer_size_mb          # default 5 MB
-    buffering_interval = var.firehose_buffer_interval_seconds # default 300 s
+    buffering_interval = var.firehose_buffer_interval_seconds # default 60 s (AWS minimum)
     compression_format = "UNCOMPRESSED"
     # ...cloudwatch_logging_options...
   }
@@ -132,16 +132,17 @@ Firehose writes a file when **either** threshold trips first:
 
 - **`buffering_size` (default 5 MB)** — flush once this much data has accumulated. Caps how large a
   burst-file gets.
-- **`buffering_interval` (default 300 s / 5 min)** — flush at most this long after the first buffered
-  record. This is what guarantees **sparse** data still lands within minutes.
+- **`buffering_interval` (default 60 s — the AWS minimum)** — flush at most this long after the first
+  buffered record. This is what guarantees **sparse** data still lands promptly. Firehose **cannot**
+  deliver to S3 faster than 60 s; that floor is a deliberate part of how the service batches.
 
 Both are exposed as Terraform variables (`firehose_buffer_size_mb`,
 `firehose_buffer_interval_seconds`) so you can tune the latency-vs-consolidation trade-off without
 editing resources:
 
-- **Lower the interval** (toward 60 s) → lower latency, but more (smaller) files and more pipeline
-  runs.
-- **Raise it** (toward 900 s) → fewer, larger files and fewer Glue runs, at the cost of latency.
+- **The default 60 s** is the AWS minimum → fastest delivery Firehose allows, best for demos.
+- **Raise it** (toward 900 s) → fewer, larger files and fewer Glue runs, at the cost of latency, when
+  latency stops mattering.
 
 ### IAM is least-privilege
 
@@ -154,22 +155,30 @@ scoped-role pattern (see [iam-roles-and-policies.md](iam-roles-and-policies.md))
 ## 6. The Producer Script
 
 [producer/stream_producer.py](../producer/stream_producer.py) simulates the music app. It reads the
-sample rows from [data/streams/](../data/streams/) and sends each as a JSON record to Firehose via
-`put_record_batch`, jittering the delay between sends so arrival is genuinely **irregular** (honoring
-the brief's "unpredictable intervals"). It supports three modes that mirror real traffic:
+sample files in [data/streams/](../data/streams/) and sends them to Firehose **one file at a time**,
+each as JSON records via `put_record_batch`, waiting a jittered interval between files. This models
+the brief's *"batch files that arrive at irregular intervals"* directly: each source file becomes one
+S3 batch object and one pipeline run.
 
-| Mode | Simulates | Records/cycle | Delay between cycles |
-|---|---|---|---|
-| `steady` | The everyday case | 50 | 5–30 s (random) |
-| `burst` | "Lots within 4 minutes" | 400 | 0–2 s (random) |
-| `sparse` | "Only twice a day" | 10 | 60–180 s (random, scaled for demo) |
+```
+ send streams1.csv  →  (wait 90–150 s)  →  send streams2.csv  →  (wait)  →  send streams3.csv
+      │                                         │                              │
+      ▼ Firehose flush                          ▼ Firehose flush               ▼ Firehose flush
+ 1 S3 object + 1 pipeline run             1 S3 object + 1 pipeline run    1 S3 object + 1 pipeline run
+```
 
 ```bash
 # Get the stream name from terraform output, then:
-python producer/stream_producer.py --stream-name music-streaming-streams-ingestion --mode steady
-python producer/stream_producer.py --stream-name music-streaming-streams-ingestion --mode burst  --cycles 3
-python producer/stream_producer.py --stream-name music-streaming-streams-ingestion --mode sparse --cycles 2
+python producer/stream_producer.py --stream-name music-streaming-streams-ingestion
+# Tune the gap between files (defaults: 90–150 s):
+python producer/stream_producer.py --stream-name music-streaming-streams-ingestion --min-delay 75 --max-delay 120
 ```
+
+**Why the wait between files must exceed 60 s.** Firehose flushes its buffer at most every 60 s
+(§5). If the producer sent the next file sooner, both files would share one buffer window and **merge
+into a single S3 object** — collapsing three arrivals into one. The default 90–150 s jittered wait
+keeps each file landing as its own object while keeping arrival times irregular. (The script warns if
+`--min-delay` is set at or below 60 s.)
 
 It only needs `boto3` and credentials with `firehose:PutRecordBatch` on the stream. Failed records
 in a batch are retried positionally before the script gives up — so a transient throttle doesn't

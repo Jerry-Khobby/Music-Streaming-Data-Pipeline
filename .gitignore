@@ -13,3 +13,6 @@ terraform/.terraform.lock.hcl
 
 data/**
 data 
+
+venv/** 
+venv 
