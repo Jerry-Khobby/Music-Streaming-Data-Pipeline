@@ -50,6 +50,16 @@ data format plus the mandated tools make that jump impossible anyway.
 
 ---
 
+> **A note on the Firehose ingestion layer.** This project uses **Kinesis Data Firehose** to ingest
+> events (see [Streaming_Ingestion_Firehose.md](Streaming_Ingestion_Firehose.md)). That is **stream
+> *ingestion / transport*** — how records *travel* and get *batched into files* — which is a different
+> thing from **stream *processing***. The argument below is against stream *processing* (computing
+> results on every event in motion). It is **not** against streaming *ingestion*. "Streaming ingest →
+> batch process" is a deliberate, standard pattern; §3a explains why the two coexist without
+> contradiction.
+
+---
+
 ## 3. Why True Stream Processing Would Have Been the *Wrong* Choice
 
 It is worth being explicit: choosing Kinesis/Kafka/Flink here would not have been "more advanced" —

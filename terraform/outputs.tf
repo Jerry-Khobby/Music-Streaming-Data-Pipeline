@@ -125,6 +125,18 @@ output "state_machine_name" {
   value       = aws_sfn_state_machine.pipeline.name
 }
 
+# ── INGESTION ─────────────────────────────────────────────────
+
+output "firehose_stream_name" {
+  description = "Kinesis Data Firehose delivery stream name — pass to the producer's --stream-name"
+  value       = aws_kinesis_firehose_delivery_stream.streams_ingestion.name
+}
+
+output "firehose_stream_arn" {
+  description = "ARN of the Firehose delivery stream"
+  value       = aws_kinesis_firehose_delivery_stream.streams_ingestion.arn
+}
+
 # ── MESSAGING ─────────────────────────────────────────────────
 
 output "sns_alerts_topic_arn" {

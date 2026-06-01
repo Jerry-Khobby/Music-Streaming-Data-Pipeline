@@ -20,7 +20,7 @@ Before the per-service detail, here is the end-to-end flow so each service has a
 mental model:
 
 ```
- [You / producer] uploads a CSV
+ [Producer script] → Kinesis Data Firehose → lands a JSON batch file
         │
         ▼
  ┌─────────────┐  ObjectCreated event   ┌──────────────┐   rule matches    ┌──────────────┐
@@ -85,6 +85,30 @@ straight into a database (e.g. RDS/Redshift). S3 was chosen because it decouples
 compute — you pay for storage cheaply and only spin up Glue compute when you process. It handles
 any file format, scales without provisioning, and integrates natively with Glue, Athena, and
 EventBridge. (See [S3_Bucket_Layers.md](S3_Bucket_Layers.md) for the layer design.)
+
+---
+
+## 2a. Kinesis Data Firehose — Streaming Ingestion
+
+**What it is.** Kinesis Data Firehose is a fully managed service that **ingests streaming records and
+delivers them, in batches, to a destination** like S3. It buffers incoming records and flushes them
+as files when a size or time threshold is reached — with no servers to manage.
+
+**What problem it solves here.** Firehose (`aws_kinesis_firehose_delivery_stream.streams_ingestion`,
+[ingestion.tf](../terraform/ingestion.tf)) is the **automated ingestion front end** that replaces
+manual CSV upload. A producer sends play events to a **Direct PUT** delivery stream; Firehose buffers
+them and lands JSON batch files in `streams/`, which triggers the existing pipeline unchanged. Its
+buffering is what turns a **burst** of events into one tidy file and still flushes **sparse** data
+within minutes. (Full detail in [Streaming_Ingestion_Firehose.md](Streaming_Ingestion_Firehose.md).)
+
+**Why Firehose over alternatives.** The obvious alternative was **Kinesis Data Streams (KDS)**. KDS
+was *not* chosen because it solves a **distribution** problem — multiple consumers, replay, strict
+ordering — that this single-consumer, no-replay pipeline does not have, and it bills per shard-hour
+even when idle (costly for sparse traffic). The problem here is **buffering variable arrivals into
+batch files cheaply**, which is exactly Firehose's job. The guiding rule: *choose components by the
+problem they solve, not by the shape of the traffic.* (The other alternative — the producer writing
+straight to S3 — was rejected because a burst would create hundreds of tiny files and pipeline runs;
+Firehose's buffer prevents that.)
 
 ---
 
@@ -294,6 +318,8 @@ what it must do, following least-privilege:
   read S3, and publish to SNS;
 - a **Pipes role** allowed only to consume SQS and start the state machine
   ([messaging.tf:177](../terraform/messaging.tf#L177));
+- a **Firehose role** allowed only to write to the raw bucket and its own log group
+  ([ingestion.tf](../terraform/ingestion.tf));
 - a **Chatbot role** with read-only CloudWatch access.
 
 (Full detail in [iam-roles-and-policies.md](iam-roles-and-policies.md).)
@@ -328,6 +354,7 @@ the infrastructure is version-controlled and auditable like the application code
 | Service | Role in pipeline | Chosen over | Key resource |
 |---|---|---|---|
 | **Amazon S3** | Stores all data: raw, silver/gold, archive; fires the trigger event | Loading straight to a DB | `aws_s3_bucket.{raw,curated,archive}` |
+| **Kinesis Data Firehose** | Ingests producer events, batches them into S3 files | Kinesis Data Streams / direct-to-S3 | `aws_kinesis_firehose_delivery_stream.streams_ingestion` |
 | **Glue Crawler** | Infers schema, registers catalog tables | Hard-coding schemas | `aws_glue_crawler.{raw,curated}_crawler` |
 | **Glue Data Catalog** | Central metastore; crawler→jobs/Athena contract | Self-managed Hive metastore | `aws_glue_catalog_database.music_db` |
 | **Glue Jobs** | Validate, transform, aggregate, load, archive | EMR / Lambda | `aws_glue_job.*` (5 jobs) |
@@ -339,7 +366,7 @@ the infrastructure is version-controlled and auditable like the application code
 | **Amazon SNS** | Single hub fanning alerts to email + Slack | Per-source notifications | `aws_sns_topic.pipeline_alerts` |
 | **AWS Chatbot** | Delivers alerts into Slack | Custom Lambda + webhook | `aws_chatbot_slack_channel_configuration.*` |
 | **Amazon CloudWatch** | Logs, metrics, alarms for the whole pipeline | Third-party observability | `aws_cloudwatch_log_group.*`, `aws_cloudwatch_metric_alarm.*` |
-| **AWS IAM** | Least-privilege roles for every component | Broad admin permissions | `aws_iam_role.*` (4 roles) |
+| **AWS IAM** | Least-privilege roles for every component | Broad admin permissions | `aws_iam_role.*` (5 roles) |
 | **Terraform** | Provisions and version-controls all of the above | Console clicks / CloudFormation | all `.tf` files |
 
 The design philosophy across every choice is consistent: **prefer managed, serverless, event-driven

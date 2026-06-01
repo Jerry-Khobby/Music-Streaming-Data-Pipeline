@@ -51,26 +51,45 @@ thing that ultimately reacts to it (Step Functions). Between them sit routing an
 services that can be changed independently. You can swap, scale, or add consumers without touching
 the producer.
 
-This pipeline's trigger chain has four links between the upload and the work:
+This pipeline's trigger chain has four links between the file landing and the work:
 
 ```
- S3 (ObjectCreated on streams/)
-   → EventBridge rule          (detects & filters the event)
-     → SQS main queue           (buffers it durably; DLQ catches failures)
-       → EventBridge Pipe        (polls the queue, reshapes the message)
-         → Step Functions        (StartExecution — the pipeline runs)
+ [producer → Kinesis Data Firehose]   (ingestion — lands a batch file in streams/)
+   → S3 (ObjectCreated on streams/)
+     → EventBridge rule          (detects & filters the event)
+       → SQS main queue           (buffers it durably; DLQ catches failures)
+         → EventBridge Pipe        (polls the queue, reshapes the message)
+           → Step Functions        (StartExecution — the pipeline runs)
 ```
 
 Each link does exactly one job. The next sections walk through them in order.
+
+> **How files arrive.** A file lands in `streams/` either from a manual upload *or* from the
+> automated **Kinesis Data Firehose** ingestion layer that batches producer events into S3 files.
+> Either way, the trigger chain below is identical — it reacts to *a file appearing*, regardless of
+> who put it there. See [Streaming_Ingestion_Firehose.md](Streaming_Ingestion_Firehose.md) for the
+> ingestion front end.
 
 ---
 
 ## 3. The Trigger Chain, Hop by Hop
 
+### Hop 0 — Firehose lands the file (ingestion)
+
+Before the trigger chain begins, a file has to *arrive*. In production that is the job of the
+**Kinesis Data Firehose** ingestion layer: a producer sends play events to a Firehose Direct PUT
+delivery stream, Firehose buffers them, and writes a batch file into `streams/`. This is **stream
+ingestion**, deliberately separate from the **batch processing** that follows — see
+[Streaming_Ingestion_Firehose.md](Streaming_Ingestion_Firehose.md) for why Firehose (not Kinesis
+Data Streams) is the right tool, and [Real_Time_vs_Batch_Justification.md](Real_Time_vs_Batch_Justification.md)
+for why ingestion-streaming and batch-processing coexist by design. A manual upload produces the
+exact same `streams/` object, so everything from Hop 1 onward is identical either way.
+
 ### Hop 1 — S3 emits an event
 
-When a file is written to the raw bucket, S3 can emit an `Object Created` event. This project turns
-that on by enabling EventBridge notifications on the raw bucket
+When a file is written to the raw bucket — by Firehose or by a manual upload — S3 can emit an
+`Object Created` event. This project turns that on by enabling EventBridge notifications on the raw
+bucket
 (`aws_s3_bucket_notification.raw_eventbridge`, in [terraform/main.tf](../terraform/main.tf)):
 
 ```hcl

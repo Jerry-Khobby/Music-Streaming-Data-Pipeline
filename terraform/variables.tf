@@ -36,6 +36,34 @@ variable "archive_bucket_name" {
   default     = "music-streaming-archive"
 }
 
+# ── Ingestion / Firehose ─────────────────────────────────────────────────────
+# These two thresholds control how often Firehose lands a batch file in S3 (it
+# flushes when EITHER trips first). Defaults consolidate a short burst into one
+# file while still flushing sparse data within ~5 minutes. Lower the interval for
+# faster latency at the cost of more, smaller files (and more pipeline runs).
+
+variable "firehose_buffer_size_mb" {
+  description = "Firehose buffer size in MB before flushing to S3 (1–128)"
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.firehose_buffer_size_mb >= 1 && var.firehose_buffer_size_mb <= 128
+    error_message = "firehose_buffer_size_mb must be between 1 and 128."
+  }
+}
+
+variable "firehose_buffer_interval_seconds" {
+  description = "Max seconds Firehose buffers records before flushing to S3 (60–900)"
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.firehose_buffer_interval_seconds >= 60 && var.firehose_buffer_interval_seconds <= 900
+    error_message = "firehose_buffer_interval_seconds must be between 60 and 900."
+  }
+}
+
 # ── DynamoDB ─────────────────────────────────────────────────────────────────
 
 variable "dynamodb_billing_mode" {

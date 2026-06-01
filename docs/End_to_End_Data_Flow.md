@@ -8,10 +8,13 @@ service the event touches** and **every transformation it undergoes**. It is wri
 engineer new to the cloud, and it ties together every other doc in this folder into one continuous
 story. Code references map to [glue_jobs/](../glue_jobs/) and [terraform/](../terraform/).
 
-> **One honest framing note:** this pipeline ingests stream events in **batch files** (CSV uploaded to
-> S3), not as a live per-tap stream. So "a single event" travels to the cloud *inside a CSV file*
-> alongside many others. We follow one event's row through that file's journey — which is exactly how
-> its data becomes a KPI.
+> **One honest framing note:** this pipeline ingests stream events in **batch files**, not as a live
+> per-tap stream. Play events are sent to **Kinesis Data Firehose**, which buffers them and lands them
+> in S3 as JSON batch files (see [Streaming_Ingestion_Firehose.md](Streaming_Ingestion_Firehose.md)).
+> So "a single event" travels to the cloud *inside a Firehose-delivered file* alongside many others.
+> We follow one event's row through that file's journey — which is exactly how its data becomes a KPI.
+> (The static `songs`/`users` reference data is still plain CSV; only the stream events flow through
+> Firehose.)
 
 ---
 
@@ -19,9 +22,12 @@ story. Code references map to [glue_jobs/](../glue_jobs/) and [terraform/](../te
 
 ```
  📱 User taps play
-     │  (logged by the app; batched into a CSV)
+     │  (app sends the event to Kinesis Data Firehose)
      ▼
- 1. CSV uploaded to S3 raw bucket  streams/streams1.csv          ← Amazon S3 (Bronze)
+ 0. Firehose buffers events, lands a JSON batch file in S3        ← Kinesis Data Firehose (ingestion)
+     │
+     ▼
+ 1. File in S3 raw bucket  streams/2024/06/25/…json              ← Amazon S3 (Bronze)
      │  S3 emits "Object Created"
      ▼
  2. EventBridge rule matches streams/ upload                      ← Amazon EventBridge
@@ -60,25 +66,28 @@ A user opens the music app and taps **play** on a song. Say the app records:
 user_id = U_8841,  track_id = T_553,  listen_time = 2026-05-17T14:22:09
 ```
 
-The app's backend collects events like this and writes them, in batches, into **CSV files**. Our one
-event becomes a single **row** in a file like `streams1.csv`, alongside thousands of other plays. At
-this moment, the event holds only three facts: *who*, *what*, and *when*. It does **not** yet know the
-song's name, genre, or duration — that enrichment happens later.
+The app's backend sends events like this to **Kinesis Data Firehose**, which **buffers** them and
+writes them out, in batches, as **JSON files** in S3 (see
+[Streaming_Ingestion_Firehose.md](Streaming_Ingestion_Firehose.md)). Our one event becomes a single
+**JSON record** inside a Firehose-delivered file, alongside many other plays. At this moment, the
+event holds only three facts: *who*, *what*, and *when*. It does **not** yet know the song's name,
+genre, or duration — that enrichment happens later.
 
 ---
 
 ## 3. Step 1 — Landing in S3 (Bronze)
 
-The CSV is uploaded to the **raw S3 bucket** under the `streams/` prefix:
+Firehose writes the batch file into the **raw S3 bucket** under the `streams/` prefix (Firehose adds
+its own date path):
 
 ```
-s3://music-streaming-raw-dev/streams/streams1.csv
+s3://music-streaming-raw-dev/streams/2024/06/25/14/music-streaming-streams-ingestion-…json
 ```
 
 - **Service:** Amazon S3 (the Bronze / landing layer — see [S3_Bucket_Layers.md](S3_Bucket_Layers.md)
   and [Medallion_Architecture.md](Medallion_Architecture.md)).
 - **Transformation:** none yet — this is the immutable, encrypted record of "what arrived." Our event
-  is now one untouched row of raw CSV.
+  is now one untouched JSON record in a raw batch file.
 - Because the bucket has EventBridge notifications enabled, the upload makes S3 **emit an `Object
   Created` event** describing the new file.
 
@@ -235,8 +244,8 @@ Our user's tap is now reflected in:
 
 | Step | Service | What it does to our event | Data shape |
 |---|---|---|---|
-| Born | App | Records `user_id, track_id, listen_time`; batched into a CSV | A CSV row |
-| 1 | **Amazon S3** (Bronze) | Stores the raw CSV immutably, encrypted | Raw CSV row |
+| Born | App → **Firehose** | Records `user_id, track_id, listen_time`; Firehose batches into a JSON file | A JSON record |
+| 1 | **Amazon S3** (Bronze) | Stores the raw JSON file immutably, encrypted | Raw JSON record |
 | 2 | **EventBridge** | Detects & filters the `streams/` upload, routes it | (event, not data) |
 | 3 | **SQS** | Buffers the event durably (DLQ as safety net) | (message) |
 | 4 | **EventBridge Pipes** | Reshapes envelope, starts the state machine | (clean input) |
@@ -254,7 +263,8 @@ Our user's tap is now reflected in:
 
 ## 10. Summary
 
-A single tap on a phone becomes a CSV row, lands in **S3**, is detected by **EventBridge**, buffered in
+A single tap on a phone is sent to **Kinesis Data Firehose**, which batches it into a JSON file that
+lands in **S3**, is detected by **EventBridge**, buffered in
 **SQS**, and handed by **Pipes** to **Step Functions**, which drives **Glue** through schema discovery,
 validation, enrichment (join + dedup → Silver), aggregation (→ Gold KPIs), and loading into
 **DynamoDB**, then refreshes **Athena** partitions and archives the source file — finishing with a
@@ -262,5 +272,5 @@ success alert via **SNS**.
 
 Along the way the event is transformed from *three raw facts* → *an enriched, typed record* → *a
 contribution to daily genre statistics* → *a servable KPI item*. That is the whole pipeline in one
-event's journey: **eleven services, one directional flow from raw tap to live metric, each step
+event's journey: **twelve services, one directional flow from raw tap to live metric, each step
 preserved, validated, idempotent, encrypted, and observable.**
