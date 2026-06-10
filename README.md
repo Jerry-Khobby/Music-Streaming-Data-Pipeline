@@ -55,6 +55,8 @@ Producer --> Firehose --> S3 Bronze --> EventBridge --> SQS --> Pipe --> Step Fu
 The full resource map with every arrow labeled is in
 [docs/Architecture_Diagram_Sketch.md](docs/Architecture_Diagram_Sketch.md).
 
+![Architecture Diagram](docs/Music-Stream-New-Diagram.drawio.svg)
+
 ---
 
 ## Technology Stack
